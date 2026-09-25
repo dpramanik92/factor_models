@@ -1,0 +1,25 @@
+# Data and generated artifacts (never committed)
+data/
+fundamentals/
+model_data/
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+
+# Env / secrets
+.env
+
+# OS
+.DS_Store
