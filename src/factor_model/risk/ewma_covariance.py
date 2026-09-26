@@ -32,6 +32,6 @@ def compute_ewma_factor_covariance(
     return latest_cov
 
 
-def save_factor_covariance(cov: pd.DataFrame) -> None:
-    save_csv(cov, config.FACTOR_COVARIANCE_FILE, index=True)
-    logger.info("Saved factor covariance matrix (%s) to %s", cov.shape, config.FACTOR_COVARIANCE_FILE)
+def save_factor_covariance(cov: pd.DataFrame, paths: config.OutputPaths = config.DEFAULT_OUTPUT_PATHS) -> None:
+    save_csv(cov, paths.factor_covariance_file, index=True)
+    logger.info("Saved factor covariance matrix (%s) to %s", cov.shape, paths.factor_covariance_file)

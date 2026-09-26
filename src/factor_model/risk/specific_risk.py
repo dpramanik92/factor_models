@@ -26,6 +26,6 @@ def compute_ewma_specific_risk(
     return out.sort_values("Symbol").reset_index(drop=True)
 
 
-def save_specific_risk(specific_risk: pd.DataFrame) -> None:
-    save_csv(specific_risk, config.SPECIFIC_RISK_FILE, index=False)
-    logger.info("Saved specific risk (%d symbols) to %s", len(specific_risk), config.SPECIFIC_RISK_FILE)
+def save_specific_risk(specific_risk: pd.DataFrame, paths: config.OutputPaths = config.DEFAULT_OUTPUT_PATHS) -> None:
+    save_csv(specific_risk, paths.specific_risk_file, index=False)
+    logger.info("Saved specific risk (%d symbols) to %s", len(specific_risk), paths.specific_risk_file)

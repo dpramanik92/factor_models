@@ -55,15 +55,26 @@ def test_newey_west_significance(summary: pd.DataFrame) -> dict:
     }
 
 
-def compute_mean_vif(exposure_panel: pd.DataFrame, n_sample_dates: int = 20) -> dict[str, float] | None:
-    """Average VIF per style factor, sampled over several dates (VIF varies by date)."""
+_VIF_COLS = config.STYLE_FACTORS + config.INDICATOR_FACTORS
+
+
+def compute_mean_vif(exposure_panel: pd.DataFrame, n_sample_dates: int = 20, cols: list[str] | None = None) -> dict[str, float] | None:
+    """Average VIF per style/indicator factor, sampled over several dates (VIF varies by date).
+    Indicator factors are included alongside the continuous style factors since e.g. top100_flag
+    is expected to correlate with the continuous z-scored size factor - exactly the kind of
+    multicollinearity this check exists to catch. `cols` defaults to _VIF_COLS (the pooled
+    model's spec); a segment-specific model (pipeline.run_segment) must pass
+    config.STYLE_FACTORS + ["psu_flag"] instead - top100_flag is constant within a single
+    segment there, and VIF is undefined for a constant column.
+    """
+    cols = cols or _VIF_COLS
     dates = sorted(exposure_panel["Date"].unique())
     sample = dates[:: max(1, len(dates) // n_sample_dates)][:n_sample_dates]
 
     vifs: list[np.ndarray] = []
     for d in sample:
-        rows = exposure_panel.loc[exposure_panel["Date"] == d, config.STYLE_FACTORS].dropna()
-        if len(rows) < len(config.STYLE_FACTORS) + 5:
+        rows = exposure_panel.loc[exposure_panel["Date"] == d, cols].dropna()
+        if len(rows) < len(cols) + 5:
             continue
         X = rows.to_numpy(dtype=float)
         try:
@@ -74,12 +85,12 @@ def compute_mean_vif(exposure_panel: pd.DataFrame, n_sample_dates: int = 20) -> 
     if not vifs:
         return None
     mean_vif = np.mean(vifs, axis=0)
-    return dict(zip(config.STYLE_FACTORS, mean_vif))
+    return dict(zip(cols, mean_vif))
 
 
-def test_vif(exposure_panel: pd.DataFrame, n_sample_dates: int = 20) -> dict:
+def test_vif(exposure_panel: pd.DataFrame, n_sample_dates: int = 20, cols: list[str] | None = None) -> dict:
     """Average VIF across style factors, sampled over several dates (VIF varies by date)."""
-    mean_vif = compute_mean_vif(exposure_panel, n_sample_dates)
+    mean_vif = compute_mean_vif(exposure_panel, n_sample_dates, cols)
 
     if mean_vif is None:
         return {
@@ -112,8 +123,22 @@ def test_residual_normality(residuals_long: pd.DataFrame) -> dict:
     }
 
 
+def _daily_alpha_nw_stats(daily_alpha: pd.Series) -> tuple[float, float, float, int] | None:
+    """(mean_alpha, annualized_pct, NW_t, n) for a daily equal-weighted residual series, or None
+    if there's too little data to fit.
+    """
+    n = len(daily_alpha)
+    if n < 3:
+        return None
+    mean_alpha = float(daily_alpha.mean())
+    lag = newey_west_lag(n)
+    ols = sm.OLS(daily_alpha.to_numpy(), np.ones((n, 1))).fit(cov_type="HAC", cov_kwds={"maxlags": lag})
+    nw_t = float(ols.tvalues[0])
+    return mean_alpha, mean_alpha * config.TRADING_DAYS_PER_YEAR * 100, nw_t, n
+
+
 def test_residual_alpha_significance(residuals_long: pd.DataFrame) -> dict:
-    """Is there a significant leftover average return the 20 factors don't explain?
+    """Is there a significant leftover average return the model's factors don't explain?
 
     The WLS fit forces the *weighted* residuals to be orthogonal to X by construction, but
     that doesn't force the plain equal-weighted average residual across stocks to be zero on
@@ -121,11 +146,13 @@ def test_residual_alpha_significance(residuals_long: pd.DataFrame) -> dict:
     systematic factor (or there's persistent cross-sectional mispricing it can't capture) -
     this is the closest analogue to an "alpha" in a specification with no separate intercept
     (industry weights, which sum to 1, play that role instead - see
-    .claude/skills/statistics/SKILL.md).
+    .claude/skills/statistics/SKILL.md). See test_residual_alpha_by_cap_segment for a version of
+    this same check that can catch two large, opposite-signed segment biases that would
+    otherwise cancel out and look fine here.
     """
     daily_alpha = residuals_long.groupby("Date")["Residual"].mean().sort_index()
-    n = len(daily_alpha)
-    if n < 3:
+    stats_result = _daily_alpha_nw_stats(daily_alpha)
+    if stats_result is None:
         return {
             "name": "Residual alpha significance",
             "statistic": "n/a",
@@ -133,21 +160,70 @@ def test_residual_alpha_significance(residuals_long: pd.DataFrame) -> dict:
             "verdict": "INFO",
             "detail": "insufficient data",
         }
-
-    mean_alpha = daily_alpha.mean()
-    lag = newey_west_lag(n)
-    ols = sm.OLS(daily_alpha.to_numpy(), np.ones((n, 1))).fit(cov_type="HAC", cov_kwds={"maxlags": lag})
-    nw_t = ols.tvalues[0]
+    mean_alpha, ann_pct, nw_t, n = stats_result
 
     return {
         "name": "Residual alpha significance",
-        "statistic": f"mean daily alpha={mean_alpha:.6f} ({mean_alpha * config.TRADING_DAYS_PER_YEAR * 100:.2f}% annualized), NW_t={nw_t:.2f}, N={n}",
+        "statistic": f"mean daily alpha={mean_alpha:.6f} ({ann_pct:.2f}% annualized), NW_t={nw_t:.2f}, N={n}",
         "threshold": "|NW_t| > 2 (5% two-sided) flags a significant unexplained alpha",
         "verdict": _verdict(abs(nw_t) <= 2),
         "detail": (
-            "significant leftover alpha - the 20 factors do not fully explain average cross-sectional returns"
+            f"significant leftover alpha - the {len(DESIGN_COLS)} factors do not fully explain average cross-sectional returns"
             if abs(nw_t) > 2
             else "no significant unexplained alpha - consistent with the factor set being reasonably complete"
+        ),
+    }
+
+
+def test_residual_alpha_by_cap_segment(residuals_long: pd.DataFrame, exposure_panel: pd.DataFrame) -> dict:
+    """Same idea as test_residual_alpha_significance, but computed separately for the
+    top-100-by-market-cap segment and the rest. Added after discovering the *pooled* residual
+    alpha (a small, borderline-significant 0.4-0.5% annualized) was actually masking two much
+    larger, highly significant, opposite-signed biases that nearly canceled out when averaged
+    together: the original 96-stock universe (89% top100) ran ~+3.4%/year, the 113 stocks added
+    in the 2026-09 expansion (87% not-top100) ran ~-2.1%/year. A style_factor x top100_flag
+    interaction-term fix was tried and made both segments' bias *worse* (NW t up to ~21), so this
+    check is also what's used to confirm the actual fix (separate per-segment regressions -
+    pipeline.run_segment) resolves it instead of just moving it around. This check applies to the
+    pooled/main model only; run it separately against each segment-specific model's own
+    residuals if you want to confirm those directly.
+    """
+    merged = residuals_long.merge(exposure_panel[["Date", "Symbol", "top100_flag"]], on=["Date", "Symbol"], how="inner")
+    merged = merged.dropna(subset=["top100_flag"])
+
+    segment_results = {}
+    for flag, label in [(1.0, "top100"), (0.0, "rest")]:
+        daily_alpha = merged.loc[merged["top100_flag"] == flag].groupby("Date")["Residual"].mean().sort_index()
+        segment_results[label] = _daily_alpha_nw_stats(daily_alpha)
+
+    if any(v is None for v in segment_results.values()):
+        return {
+            "name": "Residual alpha by cap segment (top100 vs. rest)",
+            "statistic": "n/a",
+            "threshold": "|NW_t| > 2 (5% two-sided) per segment",
+            "verdict": "INFO",
+            "detail": "insufficient data in at least one segment",
+        }
+
+    flagged = [
+        label for label, (_, _, nw_t, _) in segment_results.items() if abs(nw_t) > 2
+    ]
+    stat_str = "; ".join(
+        f"{label}: {ann_pct:.2f}% ann (NW_t={nw_t:.2f}, N={n})"
+        for label, (_, ann_pct, nw_t, n) in segment_results.items()
+    )
+
+    return {
+        "name": "Residual alpha by cap segment (top100 vs. rest)",
+        "statistic": stat_str,
+        "threshold": "|NW_t| > 2 (5% two-sided) per segment flags a significant unexplained alpha in that segment",
+        "verdict": _verdict(not flagged),
+        "detail": (
+            f"significant unexplained alpha in: {', '.join(flagged)} - a pooled-only check "
+            "(test_residual_alpha_significance) can miss this if the segments' biases partly "
+            "offset each other"
+            if flagged
+            else "no significant unexplained alpha in either cap segment"
         ),
     }
 
@@ -299,32 +375,32 @@ def test_lookahead_bias(
     }
 
 
-def test_size_quintile_spread(exposure_panel: pd.DataFrame, returns_wide: pd.DataFrame) -> dict:
-    """Q1 (smallest) vs Q5 (largest) average forward-return spread, with a t-test."""
+def test_size_decile_spread(exposure_panel: pd.DataFrame, returns_wide: pd.DataFrame) -> dict:
+    """D1 (smallest) vs D10 (largest) average forward-return spread, with a t-test."""
     returns_wide = returns_wide.copy()
     returns_wide.index.name = "Date"
     returns_long = returns_wide.reset_index().melt(id_vars="Date", var_name="Symbol", value_name="return")
 
-    merged = exposure_panel[["Date", "Symbol", "size_quintile"]].merge(
+    merged = exposure_panel[["Date", "Symbol", "size_decile"]].merge(
         returns_long, on=["Date", "Symbol"], how="inner"
-    ).dropna(subset=["size_quintile", "return"])
+    ).dropna(subset=["size_decile", "return"])
 
     if merged.empty:
         return {
-            "name": "Size-quintile (Q1 vs Q5) return spread",
+            "name": "Size-decile (D1 vs D10) return spread",
             "statistic": "n/a",
             "threshold": "informational",
             "verdict": "INFO",
             "detail": "insufficient data",
         }
 
-    q1 = merged.loc[merged["size_quintile"] == 1, "return"]
-    q5 = merged.loc[merged["size_quintile"] == 5, "return"]
-    t_stat, pvalue = stats.ttest_ind(q1.dropna(), q5.dropna(), equal_var=False)
+    d1 = merged.loc[merged["size_decile"] == 1, "return"]
+    d10 = merged.loc[merged["size_decile"] == 10, "return"]
+    t_stat, pvalue = stats.ttest_ind(d1.dropna(), d10.dropna(), equal_var=False)
 
     return {
-        "name": "Size-quintile (Q1 vs Q5) return spread",
-        "statistic": f"Q1 mean={q1.mean():.5f}, Q5 mean={q5.mean():.5f}, spread={q1.mean() - q5.mean():.5f}, t={t_stat:.2f}, p={pvalue:.4g}",
+        "name": "Size-decile (D1 vs D10) return spread",
+        "statistic": f"D1 mean={d1.mean():.5f}, D10 mean={d10.mean():.5f}, spread={d1.mean() - d10.mean():.5f}, t={t_stat:.2f}, p={pvalue:.4g}",
         "threshold": "informational (size premium/discount)",
         "verdict": "INFO",
         "detail": "",

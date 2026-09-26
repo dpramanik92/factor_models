@@ -46,6 +46,7 @@ BS_LABELS = [
     "Receivables",
     "Inventory",
     "Cash & Bank",
+    "No. of Equity Shares",
 ]
 
 CASHFLOW_LABELS = [

@@ -18,6 +18,11 @@ def _synthetic_annual_long() -> pd.DataFrame:
             "Borrowings": [50.0, 55.0, 60.0],
             "Net Block": [200.0, 220.0, 250.0],
             "Depreciation": [10.0, 11.0, 12.0],
+            # Screener reports this as a raw absolute share count, not crores (e.g. 100 crore
+            # shares -> 1e9), while every per-share numerator here is in Rs. Crore - see
+            # compute_annual_ratios' shares = .../1e7 conversion.
+            "No. of Equity Shares": [1.0e9, 1.0e9, 1.1e9],
+            "Dividend Amount": [2.0, 3.0, 4.0],
         }
     )
 
@@ -32,6 +37,9 @@ def test_ratio_formulas():
     assert np.isclose(row_2023["NetMargin"], 15.0 / 120.0)
     assert np.isclose(row_2023["RevenueGrowth"], 120.0 / 100.0 - 1.0)
     assert np.isclose(row_2023["Capex"], (220.0 - 200.0 + 11.0) / 500.0)
+    assert np.isclose(row_2023["EPS"], 15.0 / 100.0)
+    assert np.isclose(row_2023["BookValuePerShare"], 110.0 / 100.0)
+    assert np.isclose(row_2023["DividendPerShare"], 3.0 / 100.0)
 
 
 def test_zero_denominator_produces_nan_not_error():

@@ -41,36 +41,6 @@ def load_benchmark_prices() -> pd.Series:
     return df["NIFTY50"]
 
 
-def load_market_cap(universe: list[str] | None = None) -> pd.DataFrame:
-    """Daily market capitalization in rupees."""
-    return _load_wide_parquet("nse198_size_full.parquet", universe)
-
-
-def load_pe(universe: list[str] | None = None) -> pd.DataFrame:
-    """Daily trailing P/E ratio."""
-    return _load_wide_parquet("nse198_pe_full.parquet", universe)
-
-
-def load_pb(universe: list[str] | None = None) -> pd.DataFrame:
-    """Daily P/B ratio."""
-    return _load_wide_parquet("nse198_pb_full.parquet", universe)
-
-
-def load_dividend_yield(universe: list[str] | None = None) -> pd.DataFrame:
-    """Daily dividend yield (decimal, full-history version)."""
-    return _load_wide_parquet("nse198_divyield_full.parquet", universe)
-
-
-def load_beta(universe: list[str] | None = None) -> pd.DataFrame:
-    """Rolling 1-year beta vs NIFTY50."""
-    return _load_wide_parquet("nse200_rolling_1y_beta.parquet", universe)
-
-
-def load_idio_vol(universe: list[str] | None = None) -> pd.DataFrame:
-    """Idiosyncratic volatility (residual vol from the market-model regression)."""
-    return _load_wide_parquet("nse198_idio_vol_full.parquet", universe)
-
-
 def load_returns(universe: list[str] | None = None) -> pd.DataFrame:
     """Daily simple returns computed from close prices."""
     prices = load_prices(universe)
@@ -81,3 +51,8 @@ def load_returns(universe: list[str] | None = None) -> pd.DataFrame:
 
 def load_benchmark_returns() -> pd.Series:
     return load_benchmark_prices().pct_change()
+
+
+def load_volume(universe: list[str] | None = None) -> pd.DataFrame:
+    """Daily traded share volume - used by factors/liquidity.py's turnover calculation."""
+    return _load_wide_parquet("nse198_daily_volume.parquet", universe)

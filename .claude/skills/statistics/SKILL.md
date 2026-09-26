@@ -14,8 +14,8 @@ clipping is less necessary. z-score is `(x - mean) / std` computed on the winsor
 NaN-safe (missing stays missing, never imputed at this stage).
 
 Two factors are **exceptions** to plain z-scoring:
-- **Size**: z-scored `log(market_cap)` is the regression exposure; a separate `size_quintile`
-  (Q1-Q5, `pd.qcut` per date) column is retained for diagnostics only (e.g. the Q1-vs-Q5 spread
+- **Size**: z-scored `log(market_cap)` is the regression exposure; a separate `size_decile`
+  (D1-D10, `pd.qcut` per date) column is retained for diagnostics only (e.g. the D1-vs-D10 spread
   test), not fed into the regression as a categorical.
 - **Industry**: the 10-bucket weighted exposure matrix is used as-is (weights sum to 1 per
   stock) - it is not z-scored, since it plays the role of the regression intercept.

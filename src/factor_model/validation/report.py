@@ -30,21 +30,32 @@ def run_all_tests(
     returns_wide: pd.DataFrame,
     regression_results: CrossSectionalResults,
     summary: pd.DataFrame,
+    is_segment: bool = False,
 ) -> list[dict]:
+    """`is_segment=True` for a segment-specific model (pipeline.run_segment): top100_flag is
+    constant within a single segment there (VIF undefined for a constant column, and the
+    cap-segment residual-alpha check isn't meaningful on an already-single-segment model), so
+    both are adjusted/skipped accordingly.
+    """
     industry_by_symbol = load_industry_exposure(universe)
+    vif_cols = config.STYLE_FACTORS + (["psu_flag"] if is_segment else config.INDICATOR_FACTORS)
 
     tests = [
         vt.test_r2_distribution(regression_results.r2_daily),
         vt.test_newey_west_significance(summary),
-        vt.test_vif(exposure_panel),
+        vt.test_vif(exposure_panel, cols=vif_cols),
         vt.test_residual_normality(regression_results.residuals_long),
         vt.test_residual_alpha_significance(regression_results.residuals_long),
+    ]
+    if not is_segment:
+        tests.append(vt.test_residual_alpha_by_cap_segment(regression_results.residuals_long, exposure_panel))
+    tests += [
         vt.test_residual_heteroskedasticity(exposure_panel, regression_results.residuals_long),
         vt.test_residual_autocorrelation(regression_results.residuals_long),
         vt.test_industry_weights_sum_to_one(industry_by_symbol),
         vt.test_factor_stationarity(regression_results.factor_returns),
         vt.test_lookahead_bias(annual_ratios, exposure_panel),
-        vt.test_size_quintile_spread(exposure_panel, returns_wide),
+        vt.test_size_decile_spread(exposure_panel, returns_wide),
         vt.test_regression_coverage(
             regression_results.coverage_start_date,
             regression_results.skipped_low_n_dates,
@@ -60,8 +71,11 @@ def generate_plots(
     regression_results: CrossSectionalResults,
     summary: pd.DataFrame,
     factor_covariance: pd.DataFrame,
+    paths: config.OutputPaths = config.DEFAULT_OUTPUT_PATHS,
+    is_segment: bool = False,
 ) -> list[str]:
-    vif_by_factor = vt.compute_mean_vif(exposure_panel)
+    vif_cols = config.STYLE_FACTORS + (["psu_flag"] if is_segment else config.INDICATOR_FACTORS)
+    vif_by_factor = vt.compute_mean_vif(exposure_panel, cols=vif_cols)
     return vp.generate_all_plots(
         factor_returns=regression_results.factor_returns,
         summary=summary,
@@ -71,6 +85,7 @@ def generate_plots(
         exposure_panel=exposure_panel,
         returns_wide=returns_wide,
         vif_by_factor=vif_by_factor,
+        plots_dir=paths.plots_dir,
     )
 
 
@@ -109,9 +124,13 @@ def render_report(tests: list[dict], plot_paths: list[str] | None = None) -> str
     return "\n".join(lines)
 
 
-def save_report(tests: list[dict], plot_paths: list[str] | None = None) -> str:
+def save_report(
+    tests: list[dict],
+    plot_paths: list[str] | None = None,
+    paths: config.OutputPaths = config.DEFAULT_OUTPUT_PATHS,
+) -> str:
     report_text = render_report(tests, plot_paths)
-    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    config.VALIDATION_REPORT_FILE.write_text(report_text)
-    logger.info("Wrote validation report to %s", config.VALIDATION_REPORT_FILE)
+    paths.output_dir.mkdir(parents=True, exist_ok=True)
+    paths.validation_report_file.write_text(report_text)
+    logger.info("Wrote validation report to %s", paths.validation_report_file)
     return report_text

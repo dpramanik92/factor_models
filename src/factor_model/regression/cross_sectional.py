@@ -27,12 +27,12 @@ from factor_model import config
 
 logger = logging.getLogger(__name__)
 
-DESIGN_COLS = config.INDUSTRY_FACTORS + config.STYLE_FACTORS
+DESIGN_COLS = config.INDUSTRY_FACTORS + config.STYLE_FACTORS + config.INDICATOR_FACTORS
 
 
 @dataclass
 class CrossSectionalResults:
-    factor_returns: pd.DataFrame  # Date index, DESIGN_COLS columns
+    factor_returns: pd.DataFrame  # Date index, design_cols columns (DESIGN_COLS by default)
     r2_daily: pd.DataFrame  # Date, N, R2, Adj_R2
     residuals_long: pd.DataFrame  # Date, Symbol, ActualReturn, Fitted, Residual
     flagged_corporate_actions: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -65,7 +65,13 @@ def run_cross_sectional_regression(
     min_n: int = config.MIN_N_PER_DAY,
     rf_annual: float = config.RF_ANNUAL,
     corporate_action_threshold: float = config.CORPORATE_ACTION_RETURN_THRESHOLD,
+    design_cols: list[str] = DESIGN_COLS,
 ) -> CrossSectionalResults:
+    """`design_cols` defaults to the module-level DESIGN_COLS (the full pooled-model spec) but
+    a segment-specific regression (pipeline.run_segment) passes config.SEGMENT_DESIGN_COLS
+    instead, since top100_flag (and any interaction with it) is constant/absent within a single
+    segment and would make the design matrix singular.
+    """
     merged = _build_regression_input(exposure_panel, returns_wide)
 
     rf_daily = rf_annual / config.TRADING_DAYS_PER_YEAR
@@ -79,7 +85,7 @@ def run_cross_sectional_regression(
         logger.warning("Flagged %d likely-corporate-action observations (|return| > %.0f%%)", flagged_mask.sum(), corporate_action_threshold * 100)
     clean = merged.loc[~flagged_mask].copy()
 
-    required_cols = DESIGN_COLS + ["excess_return", "market_cap"]
+    required_cols = design_cols + ["excess_return", "market_cap"]
     clean = clean.dropna(subset=required_cols)
     clean = clean[clean["market_cap"] > 0]
 
@@ -104,7 +110,7 @@ def run_cross_sectional_regression(
             logger.warning("Skipping %s: zero cross-sectional return variance (likely an unflagged holiday)", target_date)
             continue
 
-        X = group[DESIGN_COLS].to_numpy(dtype=float)
+        X = group[design_cols].to_numpy(dtype=float)
         y = group["excess_return"].to_numpy(dtype=float)
         w = np.sqrt(group["market_cap"].to_numpy(dtype=float))
 
@@ -115,7 +121,7 @@ def run_cross_sectional_regression(
         # the EWMA covariance step, and the stationarity validation test, all of which would
         # otherwise treat an "N" column as if it were a 21st factor. N lives in r2_daily and
         # is re-joined only when writing the CSV output (regression/results.py).
-        coef_rows.append({"Date": target_date, **dict(zip(DESIGN_COLS, model.params))})
+        coef_rows.append({"Date": target_date, **dict(zip(design_cols, model.params))})
         r2_rows.append(
             {"Date": target_date, "N": n, "R2": model.rsquared, "Adj_R2": model.rsquared_adj}
         )

@@ -61,6 +61,21 @@ def compute_annual_ratios(fundamentals_annual_long: pd.DataFrame) -> pd.DataFram
     df["ROE"] = _safe_divide(df["Net profit"], equity)
     df["NetMargin"] = _safe_divide(df["Net profit"], df["Sales"])
 
+    # Per-share figures, used by factors/value.py to compute PE/PB/dividend yield in-house
+    # (instead of the precomputed data/nse198_{pe,pb,divyield}_full files, which only cover
+    # 2020-09-22 onward regardless of how far back the price panel itself goes).
+    # "No. of Equity Shares" is Screener's raw absolute share count, while every numerator here
+    # (Net profit, equity, Dividend Amount) is in Rs. Crore - divide shares by 1e7 too (crore =
+    # 1e7) so the per-share result is in plain rupees, not off by ~1e7. Found by equity_researcher
+    # review (2026-09): this was previously numerically inert (the ~1e7 mis-scale is a uniform
+    # positive constant across every company/date, so it cancelled out exactly under factors/
+    # value.py's per-date winsorize+z-score), but left uncorrected it's a landmine for any future
+    # consumer of these columns as raw diagnostic numbers.
+    shares = (df["No. of Equity Shares"] / 1e7).where(df["No. of Equity Shares"] > 0)
+    df["EPS"] = _safe_divide(df["Net profit"], shares)
+    df["BookValuePerShare"] = _safe_divide(equity, shares)
+    df["DividendPerShare"] = _safe_divide(df["Dividend Amount"], shares)
+
     grp = df.groupby("Symbol")
     prior_net_block = grp["Net Block"].shift(1)
     prior_total_assets = grp["Total Assets"].shift(1)

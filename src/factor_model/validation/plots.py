@@ -1,11 +1,13 @@
-"""Diagnostic plots saved to output/plots/. Plain matplotlib - these are internal engineering
-diagnostics, not chat-facing visualizations (see .claude/skills/design/SKILL.md). Same color per
-factor across every plot; industry vs style visually distinguished by linestyle.
+"""Diagnostic plots saved to output/plots/ (or a period-scoped plots dir - see
+config.OutputPaths). Plain matplotlib - these are internal engineering diagnostics, not
+chat-facing visualizations (see .claude/skills/design/SKILL.md). Same color per factor across
+every plot; industry vs style visually distinguished by linestyle.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import matplotlib
 
@@ -20,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 _INDUSTRY_STYLE = {"linestyle": "-", "alpha": 0.85}
 _STYLE_STYLE = {"linestyle": "-", "alpha": 0.95, "linewidth": 1.8}
+_INDICATOR_STYLE = {"linestyle": "--", "alpha": 0.95, "linewidth": 2.2}
 
 
 def _factor_colors() -> dict[str, str]:
@@ -27,7 +30,7 @@ def _factor_colors() -> dict[str, str]:
     return {f: cmap(i % 20) for i, f in enumerate(config.ALL_FACTORS)}
 
 
-def plot_cumulative_factor_returns(factor_returns: pd.DataFrame) -> list[str]:
+def plot_cumulative_factor_returns(factor_returns: pd.DataFrame, plots_dir: Path = config.PLOTS_DIR) -> list[str]:
     """Two panels: cumulative industry factor returns, cumulative style factor returns."""
     colors = _factor_colors()
     cum = (1.0 + factor_returns).cumprod() - 1.0
@@ -36,6 +39,7 @@ def plot_cumulative_factor_returns(factor_returns: pd.DataFrame) -> list[str]:
     for group_name, cols, kw in [
         ("industry", config.INDUSTRY_FACTORS, _INDUSTRY_STYLE),
         ("style", config.STYLE_FACTORS, _STYLE_STYLE),
+        ("indicator", config.INDICATOR_FACTORS, _INDICATOR_STYLE),
     ]:
         fig, ax = plt.subplots(figsize=(11, 6))
         for col in cols:
@@ -47,7 +51,7 @@ def plot_cumulative_factor_returns(factor_returns: pd.DataFrame) -> list[str]:
         ax.set_xlabel("Date")
         ax.legend(loc="upper left", fontsize=8, ncol=2)
         fig.autofmt_xdate()
-        path = config.PLOTS_DIR / f"cumulative_{group_name}_factor_returns.png"
+        path = plots_dir / f"cumulative_{group_name}_factor_returns.png"
         fig.tight_layout()
         fig.savefig(path, dpi=150)
         plt.close(fig)
@@ -55,7 +59,7 @@ def plot_cumulative_factor_returns(factor_returns: pd.DataFrame) -> list[str]:
     return paths
 
 
-def plot_factor_significance(summary: pd.DataFrame) -> str:
+def plot_factor_significance(summary: pd.DataFrame, plots_dir: Path = config.PLOTS_DIR) -> str:
     df = summary.sort_values("NW_t")
     colors = ["#d62728" if abs(t) > 2 else "#7f7f7f" for t in df["NW_t"]]
     fig, ax = plt.subplots(figsize=(9, 8))
@@ -66,13 +70,13 @@ def plot_factor_significance(summary: pd.DataFrame) -> str:
     ax.set_xlabel("Newey-West t-stat")
     ax.set_title("Factor significance (red = |NW t| > 2)")
     fig.tight_layout()
-    path = config.PLOTS_DIR / "factor_significance.png"
+    path = plots_dir / "factor_significance.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
 
 
-def plot_r2_timeseries(r2_daily: pd.DataFrame) -> str:
+def plot_r2_timeseries(r2_daily: pd.DataFrame, plots_dir: Path = config.PLOTS_DIR) -> str:
     df = r2_daily.copy()
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date")
@@ -87,13 +91,13 @@ def plot_r2_timeseries(r2_daily: pd.DataFrame) -> str:
     ax.legend()
     fig.autofmt_xdate()
     fig.tight_layout()
-    path = config.PLOTS_DIR / "r2_daily.png"
+    path = plots_dir / "r2_daily.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
 
 
-def plot_factor_correlation_heatmap(factor_covariance: pd.DataFrame) -> str:
+def plot_factor_correlation_heatmap(factor_covariance: pd.DataFrame, plots_dir: Path = config.PLOTS_DIR) -> str:
     cov = factor_covariance.to_numpy()
     std = np.sqrt(np.diag(cov))
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -109,13 +113,13 @@ def plot_factor_correlation_heatmap(factor_covariance: pd.DataFrame) -> str:
     ax.set_title("EWMA factor correlation matrix")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.tight_layout()
-    path = config.PLOTS_DIR / "factor_correlation_heatmap.png"
+    path = plots_dir / "factor_correlation_heatmap.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
 
 
-def plot_vif(summary_or_vif: dict[str, float]) -> str:
+def plot_vif(summary_or_vif: dict[str, float], plots_dir: Path = config.PLOTS_DIR) -> str:
     factors = list(summary_or_vif.keys())
     values = list(summary_or_vif.values())
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -126,13 +130,13 @@ def plot_vif(summary_or_vif: dict[str, float]) -> str:
     ax.set_title("Style factor multicollinearity (VIF)")
     ax.legend()
     fig.tight_layout()
-    path = config.PLOTS_DIR / "vif.png"
+    path = plots_dir / "vif.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
 
 
-def plot_residual_histogram(residuals_long: pd.DataFrame) -> str:
+def plot_residual_histogram(residuals_long: pd.DataFrame, plots_dir: Path = config.PLOTS_DIR) -> str:
     resid = residuals_long["Residual"].dropna()
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.hist(resid, bins=200, density=True, color="#1f77b4", alpha=0.7, label="Residuals")
@@ -143,20 +147,20 @@ def plot_residual_histogram(residuals_long: pd.DataFrame) -> str:
     ax.set_xlabel("Residual (excess return)")
     ax.legend()
     fig.tight_layout()
-    path = config.PLOTS_DIR / "residual_histogram.png"
+    path = plots_dir / "residual_histogram.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
 
 
-def plot_daily_alpha(residuals_long: pd.DataFrame) -> str:
+def plot_daily_alpha(residuals_long: pd.DataFrame, plots_dir: Path = config.PLOTS_DIR) -> str:
     daily_alpha = residuals_long.groupby("Date")["Residual"].mean().sort_index()
     cum_alpha = (1.0 + daily_alpha).cumprod() - 1.0
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
     ax1.plot(daily_alpha.index, daily_alpha.values * 100, color="#7f7f7f", linewidth=0.7)
     ax1.axhline(0, color="black", linewidth=0.6)
-    ax1.set_title("Daily equal-weighted residual ('alpha') - unexplained by the 20 factors")
+    ax1.set_title(f"Daily equal-weighted residual ('alpha') - unexplained by the {len(config.ALL_FACTORS)} factors")
     ax1.set_ylabel("Daily alpha (%)")
 
     ax2.plot(cum_alpha.index, cum_alpha.values * 100, color="#1f77b4", linewidth=1.5)
@@ -165,30 +169,32 @@ def plot_daily_alpha(residuals_long: pd.DataFrame) -> str:
     ax2.set_xlabel("Date")
     fig.autofmt_xdate()
     fig.tight_layout()
-    path = config.PLOTS_DIR / "residual_alpha.png"
+    path = plots_dir / "residual_alpha.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
 
 
-def plot_size_quintile_spread(exposure_panel: pd.DataFrame, returns_wide: pd.DataFrame) -> str:
+def plot_size_decile_spread(
+    exposure_panel: pd.DataFrame, returns_wide: pd.DataFrame, plots_dir: Path = config.PLOTS_DIR
+) -> str:
     returns_wide = returns_wide.copy()
     returns_wide.index.name = "Date"
     returns_long = returns_wide.reset_index().melt(id_vars="Date", var_name="Symbol", value_name="return")
 
-    merged = exposure_panel[["Date", "Symbol", "size_quintile"]].merge(
+    merged = exposure_panel[["Date", "Symbol", "size_decile"]].merge(
         returns_long, on=["Date", "Symbol"], how="inner"
-    ).dropna(subset=["size_quintile", "return"])
+    ).dropna(subset=["size_decile", "return"])
 
-    means = merged.groupby("size_quintile")["return"].mean() * 100
+    means = merged.groupby("size_decile")["return"].mean() * 100
 
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.bar([f"Q{int(q)}" for q in means.index], means.values, color="#1f77b4")
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar([f"D{int(d)}" for d in means.index], means.values, color="#1f77b4")
     ax.axhline(0, color="black", linewidth=0.6)
-    ax.set_title("Average daily return by size quintile (Q1=smallest, Q5=largest)")
+    ax.set_title("Average daily return by size decile (D1=smallest, D10=largest)")
     ax.set_ylabel("Mean daily return (%)")
     fig.tight_layout()
-    path = config.PLOTS_DIR / "size_quintile_spread.png"
+    path = plots_dir / "size_decile_spread.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return str(path)
@@ -203,17 +209,18 @@ def generate_all_plots(
     exposure_panel: pd.DataFrame,
     returns_wide: pd.DataFrame,
     vif_by_factor: dict[str, float] | None = None,
+    plots_dir: Path = config.PLOTS_DIR,
 ) -> list[str]:
-    config.PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
-    paths += plot_cumulative_factor_returns(factor_returns)
-    paths.append(plot_factor_significance(summary))
-    paths.append(plot_r2_timeseries(r2_daily))
-    paths.append(plot_factor_correlation_heatmap(factor_covariance))
+    paths += plot_cumulative_factor_returns(factor_returns, plots_dir)
+    paths.append(plot_factor_significance(summary, plots_dir))
+    paths.append(plot_r2_timeseries(r2_daily, plots_dir))
+    paths.append(plot_factor_correlation_heatmap(factor_covariance, plots_dir))
     if vif_by_factor:
-        paths.append(plot_vif(vif_by_factor))
-    paths.append(plot_residual_histogram(residuals_long))
-    paths.append(plot_daily_alpha(residuals_long))
-    paths.append(plot_size_quintile_spread(exposure_panel, returns_wide))
-    logger.info("Wrote %d plots to %s", len(paths), config.PLOTS_DIR)
+        paths.append(plot_vif(vif_by_factor, plots_dir))
+    paths.append(plot_residual_histogram(residuals_long, plots_dir))
+    paths.append(plot_daily_alpha(residuals_long, plots_dir))
+    paths.append(plot_size_decile_spread(exposure_panel, returns_wide, plots_dir))
+    logger.info("Wrote %d plots to %s", len(paths), plots_dir)
     return paths

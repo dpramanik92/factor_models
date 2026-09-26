@@ -18,12 +18,16 @@ from factor_model.factors.growth import compute_growth
 from factor_model.factors.idio_vol import compute_idio_vol
 from factor_model.factors.industry import expand_industry_exposure_daily, load_industry_exposure
 from factor_model.factors.leverage import compute_leverage
+from factor_model.factors.liquidity import compute_liquidity
+from factor_model.factors.market_cap import compute_market_cap
 from factor_model.factors.momentum import compute_momentum
 from factor_model.factors.profitability import compute_profitability
+from factor_model.factors.psu import compute_psu_flag
 from factor_model.factors.quality import compute_quality
 from factor_model.factors.size import compute_size
+from factor_model.factors.top100 import compute_top100_flag
 from factor_model.factors.value import compute_value
-from factor_model.io.loaders import load_market_cap, load_returns
+from factor_model.io.loaders import load_returns
 
 logger = logging.getLogger(__name__)
 
@@ -47,22 +51,29 @@ def build_exposure_panel(
     annual_ratios: pd.DataFrame,
     business_day_index: pd.DatetimeIndex,
 ) -> pd.DataFrame:
-    """Build and save the full (Date, Symbol, <10 industry weights>, <10 style factors>,
-    size_quintile, market_cap) exposure panel.
+    """Build and save the full (Date, Symbol, <10 industry weights>, <11 style factors>,
+    <2 indicator factors: top100_flag, psu_flag>, size_decile, market_cap) exposure panel.
     """
     panel = _full_grid(universe, business_day_index)
+
+    # Computed once and shared: the size factor's raw input and the WLS regression weight
+    # (sqrt(market_cap)) both need the same market cap panel - see factors/market_cap.py.
+    market_cap_wide = compute_market_cap(annual_ratios, business_day_index)
 
     raw_frames = [
         compute_beta(universe),
         compute_idio_vol(universe),
         compute_momentum(universe),
-        compute_size(universe),  # contributes 'size' and 'size_quintile'
-        compute_value(universe),
+        compute_size(market_cap_wide),  # contributes 'size' and 'size_decile'
+        compute_value(annual_ratios, business_day_index),
         compute_leverage(annual_ratios, business_day_index),
         compute_quality(annual_ratios, business_day_index),
         compute_capex(annual_ratios, business_day_index),
         compute_growth(annual_ratios, business_day_index),
         compute_profitability(annual_ratios, business_day_index),
+        compute_liquidity(universe, annual_ratios, business_day_index),
+        compute_top100_flag(market_cap_wide),
+        compute_psu_flag(universe, business_day_index),
     ]
     for frame in raw_frames:
         panel = panel.merge(frame, on=["Date", "Symbol"], how="left")
@@ -71,7 +82,6 @@ def build_exposure_panel(
     industry_long = expand_industry_exposure_daily(industry_by_symbol, business_day_index)
     panel = panel.merge(industry_long, on=["Date", "Symbol"], how="left")
 
-    market_cap_wide = load_market_cap(universe)
     market_cap_wide.index.name = "Date"
     market_cap_long = market_cap_wide.reset_index().melt(
         id_vars="Date", var_name="Symbol", value_name="market_cap"
@@ -80,6 +90,16 @@ def build_exposure_panel(
 
     for col in config.STYLE_FACTORS:
         panel[col] = standardize.cross_sectional_winsorize_zscore(panel, "Date", col)
+
+    # add_size_decile_dummies (factors/size.py) was tried here and reverted - see
+    # config.INDICATOR_FACTORS for why. Not called; kept as tested, working code in case it's
+    # useful in a different combination later.
+
+    # A single size x top100_flag interaction column was also tried here and reverted (see
+    # CLAUDE.md's "Known limitations"): pooled residual alpha improved (0.42%->0.07% annualized)
+    # but the segment-level bias this was meant to fix got *worse* (NW t 17.3/-7.8 -> 20.2/-17.6),
+    # the same pooled-metric-masks-a-worse-segment-split pattern as the full interaction/decile-
+    # dummy attempts. Not wired back in.
 
     config.MODEL_DATA_DIR.mkdir(parents=True, exist_ok=True)
     panel.to_parquet(config.FACTOR_EXPOSURE_PANEL_FILE, index=False)

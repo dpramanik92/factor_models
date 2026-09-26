@@ -1,10 +1,14 @@
 """Value factor: composite of earnings yield, book yield, and dividend yield.
 
-E/P = 1/PE and B/P = 1/PB are used instead of raw PE/PB to avoid the sign
-flips and blow-ups that raw P/E or P/B ratios produce near zero or negative
-earnings/book value. Each subcomponent is winsorized and z-scored per date,
-then averaged (requiring at least 2 of 3 non-missing) and re-z-scored into a
-single Value factor - see .claude/skills/statistics/SKILL.md.
+E/P and B/P are computed in-house from daily price x point-in-time per-share fundamentals
+(EPS, book value per share, dividend per share - factors/fundamentals_ratios.py), not loaded
+from the precomputed data/nse198_{pe,pb,divyield}_full files, which only cover 2020-09-22
+onward regardless of how far back the price panel itself goes (see CLAUDE.md "History
+extension"). E/P = EPS/Price and B/P = BookValuePerShare/Price are used instead of raw P/E or
+P/B to avoid the sign flips and blow-ups those ratios produce near zero or negative
+earnings/book value. Each subcomponent is winsorized and z-scored per date, then averaged
+(requiring at least 2 of 3 non-missing) and re-z-scored into a single Value factor - see
+.claude/skills/statistics/SKILL.md.
 """
 
 from __future__ import annotations
@@ -15,30 +19,35 @@ import numpy as np
 import pandas as pd
 
 from factor_model.factors._util import wide_to_long
-from factor_model.io.loaders import load_dividend_yield, load_pb, load_pe
+from factor_model.factors.pit import expand_frame_to_daily
+from factor_model.io.loaders import load_prices
 from factor_model.standardize import winsorize_zscore
 
 
-def compute_value(universe: list[str]) -> pd.DataFrame:
-    """Returns long (Date, Symbol, value) for the given universe: the raw (pre-final-zscore)
-    composite of the three standardized subcomponents (E/P, B/P, dividend yield). Subcomponent
-    standardization happens here (needed to combine incommensurable ratios); the final
-    re-standardization of the composite happens uniformly in factors/panel.py.
+def compute_value(annual_ratios: pd.DataFrame, business_day_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Returns long (Date, Symbol, value) - the raw (pre-final-zscore) composite of the three
+    standardized subcomponents (E/P, B/P, dividend yield). Subcomponent standardization happens
+    here (needed to combine incommensurable ratios); the final re-standardization of the
+    composite happens uniformly in factors/panel.py.
     """
-    pe = load_pe(universe)
-    pb = load_pb(universe)
-    div_yield = load_dividend_yield(universe)
+    universe = sorted(annual_ratios["Symbol"].unique())
+    prices = load_prices(universe).reindex(index=business_day_index, columns=universe)
 
-    ep = 1.0 / pe.where(pe > 0)
-    bp = 1.0 / pb.where(pb > 0)
-    dy = div_yield.where(div_yield >= 0)
+    eps_by_symbol = {s: g.set_index("FiscalYearEnd")["EPS"] for s, g in annual_ratios.groupby("Symbol")}
+    bvps_by_symbol = {
+        s: g.set_index("FiscalYearEnd")["BookValuePerShare"] for s, g in annual_ratios.groupby("Symbol")
+    }
+    dps_by_symbol = {
+        s: g.set_index("FiscalYearEnd")["DividendPerShare"] for s, g in annual_ratios.groupby("Symbol")
+    }
+    eps_daily = expand_frame_to_daily(eps_by_symbol, business_day_index).reindex(columns=universe)
+    bvps_daily = expand_frame_to_daily(bvps_by_symbol, business_day_index).reindex(columns=universe)
+    dps_daily = expand_frame_to_daily(dps_by_symbol, business_day_index).reindex(columns=universe)
 
-    # Align all three to the same (Date, Symbol) grid before combining.
-    common_index = ep.index.union(bp.index).union(dy.index)
-    common_cols = sorted(set(ep.columns) | set(bp.columns) | set(dy.columns))
-    ep = ep.reindex(index=common_index, columns=common_cols)
-    bp = bp.reindex(index=common_index, columns=common_cols)
-    dy = dy.reindex(index=common_index, columns=common_cols)
+    price_positive = prices.where(prices > 0)
+    ep = eps_daily.where(eps_daily > 0) / price_positive
+    bp = bvps_daily.where(bvps_daily > 0) / price_positive
+    dy = dps_daily.where(dps_daily >= 0) / price_positive
 
     ep_z = ep.apply(lambda row: winsorize_zscore(row), axis=1)
     bp_z = bp.apply(lambda row: winsorize_zscore(row), axis=1)
@@ -56,7 +65,7 @@ def compute_value(universe: list[str]) -> pd.DataFrame:
     # Composite is an average of already-standardized subcomponents; the final
     # re-standardization happens uniformly in factors/panel.py alongside every
     # other style factor, so we return the raw composite here.
-    composite_df = pd.DataFrame(composite, index=common_index, columns=common_cols)
+    composite_df = pd.DataFrame(composite, index=business_day_index, columns=universe)
     composite_df.index.name = "Date"
 
     return wide_to_long(composite_df, "value")

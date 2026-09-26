@@ -46,6 +46,46 @@ def test_wls_regression_recovers_known_coefficients():
     assert not result.skipped_low_n_dates
 
 
+def test_design_cols_parameter_restricts_design_matrix():
+    # A segment-specific regression (pipeline.run_segment) passes a smaller design_cols list
+    # (dropping top100_flag/interactions, constant within a single segment) - verify the
+    # regression actually uses that list, not the module-level DESIGN_COLS default.
+    rng = np.random.default_rng(1)
+    n_symbols = 40
+    n_dates = 30
+    symbols = [f"S{i}" for i in range(n_symbols)]
+    dates = pd.bdate_range("2024-01-01", periods=n_dates + 1)
+    custom_cols = ["beta", "size", "psu_flag"]
+    true_coef = rng.normal(scale=0.001, size=len(custom_cols))
+
+    exposure_rows = []
+    return_rows = {}
+    for i, d in enumerate(dates[:-1]):
+        X = rng.normal(size=(n_symbols, len(custom_cols)))
+        market_cap = rng.uniform(1e9, 1e11, size=n_symbols)
+        noise = rng.normal(scale=0.0005, size=n_symbols)
+        y = X @ true_coef + noise
+
+        for j, symbol in enumerate(symbols):
+            row = {"Date": d, "Symbol": symbol, "market_cap": market_cap[j]}
+            row.update(dict(zip(custom_cols, X[j])))
+            exposure_rows.append(row)
+
+        return_rows[dates[i + 1]] = pd.Series(y, index=symbols)
+
+    exposure_panel = pd.DataFrame(exposure_rows)
+    returns_wide = pd.DataFrame(return_rows).T
+    returns_wide.index.name = "Date"
+
+    result = run_cross_sectional_regression(
+        exposure_panel, returns_wide, min_n=10, rf_annual=0.0, design_cols=custom_cols
+    )
+
+    assert list(result.factor_returns.columns) == custom_cols
+    recovered_mean = result.factor_returns[custom_cols].mean().to_numpy()
+    np.testing.assert_allclose(recovered_mean, true_coef, atol=5e-4)
+
+
 def test_low_n_dates_are_skipped_while_others_still_fit():
     # date_to_target is built purely from exposure_panel's own unique dates: with K unique
     # exposure dates you get K-1 mappings (exposure[i] -> target dates[i+1]), and the *last*
