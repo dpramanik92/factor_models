@@ -18,6 +18,7 @@ def _synthetic_annual_long() -> pd.DataFrame:
             "Borrowings": [50.0, 55.0, 60.0],
             "Net Block": [200.0, 220.0, 250.0],
             "Depreciation": [10.0, 11.0, 12.0],
+            "Cash from Operating Activity": [12.0, 8.0, 20.0],
             # Screener reports this as a raw absolute share count, not crores (e.g. 100 crore
             # shares -> 1e9), while every per-share numerator here is in Rs. Crore - see
             # compute_annual_ratios' shares = .../1e7 conversion.
@@ -40,6 +41,7 @@ def test_ratio_formulas():
     assert np.isclose(row_2023["EPS"], 15.0 / 100.0)
     assert np.isclose(row_2023["BookValuePerShare"], 110.0 / 100.0)
     assert np.isclose(row_2023["DividendPerShare"], 3.0 / 100.0)
+    assert np.isclose(row_2023["Accruals"], (15.0 - 8.0) / 550.0)
 
 
 def test_zero_denominator_produces_nan_not_error():
@@ -49,6 +51,14 @@ def test_zero_denominator_produces_nan_not_error():
     row = result[result["FiscalYearEnd"] == "2023-03-31"].iloc[0]
     assert pd.isna(row["Leverage"])
     assert pd.isna(row["ROE"])
+
+
+def test_accruals_zero_total_assets_produces_nan():
+    df = _synthetic_annual_long()
+    df.loc[df["FiscalYearEnd"] == "2023-03-31", "Total Assets"] = 0.0
+    result = compute_annual_ratios(df)
+    row = result[result["FiscalYearEnd"] == "2023-03-31"].iloc[0]
+    assert pd.isna(row["Accruals"])
 
 
 def test_non_annual_gap_excluded_from_growth_and_capex():

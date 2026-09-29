@@ -101,6 +101,12 @@ INDUSTRY_EXPOSURE_XLSX = DATA_DIR / "nse_200_industry_exposure.xlsx"
 #: forward-filled into the daily panel until this many days after FY-end.
 REPORTING_LAG_DAYS = 60
 
+#: SEBI LODR's quarterly (non-Q4) financial-results filing deadline - shorter than the annual
+#: REPORTING_LAG_DAYS since quarterly results are unaudited/limited-review, not a full audit.
+#: Used only by the exploratory quarterly-SUE/PEAD check (factors/pead.py) - not part of the
+#: main annual-frequency pipeline.
+QUARTERLY_REPORTING_LAG_DAYS = 45
+
 #: Flat annual risk-free rate used to convert raw returns to excess returns,
 #: taken from data/nifty50_benchmark_stats.csv's Sharpe_rf5.5pct column.
 RF_ANNUAL = 0.055
@@ -327,6 +333,16 @@ PORTFOLIO_SEGMENTS_VALIDATION_REPORT_FILE = PORTFOLIO_SEGMENTS_OUTPUT_DIR / "por
 PORTFOLIO_SEGMENTS_BACKTEST_OUTPUT_DIR = PORTFOLIO_SEGMENTS_OUTPUT_DIR / "backtest"
 PORTFOLIO_SEGMENTS_BACKTEST_REPORT_FILE = PORTFOLIO_SEGMENTS_BACKTEST_OUTPUT_DIR / "backtest_report.md"
 
+#: Pooled-model portfolio run with portfolio/macro_timing.py's tilts enabled (`--macro-timing`) -
+#: a distinct sibling directory to PORTFOLIO_OUTPUT_DIR, never the same one, so turning the flag
+#: on or off never silently overwrites the other run's result (the same "add, don't overwrite"
+#: convention config.PORTFOLIO_SEGMENTS_OUTPUT_DIR's siblings already follow).
+PORTFOLIO_MACRO_TIMING_OUTPUT_DIR = OUTPUT_DIR / "portfolio_macro_timing"
+PORTFOLIO_MACRO_TIMING_PLOTS_DIR = PORTFOLIO_MACRO_TIMING_OUTPUT_DIR / "plots"
+PORTFOLIO_MACRO_TIMING_VALIDATION_REPORT_FILE = PORTFOLIO_MACRO_TIMING_OUTPUT_DIR / "portfolio_validation_report.md"
+PORTFOLIO_MACRO_TIMING_BACKTEST_OUTPUT_DIR = PORTFOLIO_MACRO_TIMING_OUTPUT_DIR / "backtest"
+PORTFOLIO_MACRO_TIMING_BACKTEST_REPORT_FILE = PORTFOLIO_MACRO_TIMING_BACKTEST_OUTPUT_DIR / "backtest_report.md"
+
 #: Newey-West |t| thresholds used to shrink each factor's expected daily return toward zero
 #: (portfolio/expected_returns.py). A factor with |NW_t| (computed over the full historical
 #: series - "was this ever a real signal") at or below T_MIN is treated as statistically
@@ -351,6 +367,40 @@ EXPECTED_RETURN_EWMA_HALFLIFE_DAYS = 90
 #: Trailing window (trading days) for the static-weight portfolio backtest used in both the
 #: realized-vs-predicted-risk validation check and the cumulative-performance plot.
 PORTFOLIO_BACKTEST_LOOKBACK_DAYS = 252
+
+# --- Macro-momentum timing tilts (portfolio/macro_timing.py) ----------------------------------
+#: Two group-specific expected-return tilts found via alpha research (CLAUDE.md's "Alpha
+#: research" section) and, unlike everything else there, actually wired into the optimizer:
+#: Oil-sector returns' sensitivity to oil-price momentum, and IT-exporter returns' sensitivity to
+#: USD/INR momentum. Both survived Bonferroni correction across every group specification tried,
+#: and the USD/INR one specifically survived being isolated from a real "AI-narrative" proxy
+#: (Accenture's own return) and a market-beta control (NIFTY 50's own return) - see CLAUDE.md.
+#: The regression slope itself is *never* hardcoded from that research run - it's re-estimated
+#: fresh from an expanding window of history every time compute_macro_timing_tilt is called
+#: (including at every rebalance date inside the walk-forward backtest), the same point-in-time
+#: discipline portfolio/expected_returns.py's own EWMA/shrinkage estimates already follow, so an
+#: early backtest period never uses a slope that could only be known with later data.
+OIL_TICKER = "BZ=F"  # Brent crude futures (yfinance)
+USDINR_TICKER = "INR=X"  # USD/INR spot (yfinance)
+
+OIL_GROUP_SYMBOLS = ["BPCL", "HINDPETRO", "PETRONET", "IGL", "GAIL", "ONGC", "IOC"]
+IT_EXPORTER_SYMBOLS = ["COFORGE", "LTIM", "LTTS", "MPHASIS", "PERSISTENT", "SONATSOFTW", "TATAELXSI", "KPITTECH", "MAPMYINDIA"]
+
+#: Trailing months of oil-price / USD-INR change compounded into the momentum reading fed to
+#: each group's own predictive regression - matches the 3-month window the original research used.
+OIL_MOMENTUM_LOOKBACK_MONTHS = 3
+USDINR_MOMENTUM_LOOKBACK_MONTHS = 3
+
+#: macro_predictive_regression's own minimum-overlapping-months requirement (regression/
+#: macro_predictability.py) - reproduced here only so callers can check "will a tilt even be
+#: computable yet" without importing that module's internals.
+MACRO_TIMING_MIN_MONTHS = 24
+
+#: Trading days per calendar month, used only to convert a monthly-frequency regression slope's
+#: implied monthly return contribution into the daily-return units portfolio/expected_returns.py
+#: works in - matches factors/momentum.py's MOMENTUM_LAG_DAYS (the same "one month" convention
+#: used everywhere else in this model).
+TRADING_DAYS_PER_MONTH = 21
 
 #: Number of efficient-frontier points traced at *each monthly rebalance* of the walk-forward
 #: backtest (portfolio/backtest.py) - deliberately fewer than FRONTIER_N_POINTS (25, used for

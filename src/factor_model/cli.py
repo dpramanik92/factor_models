@@ -110,14 +110,23 @@ def run_segments_cmd() -> None:
         click.echo("")
 
 
+_macro_timing_option = click.option(
+    "--macro-timing", is_flag=True, default=False,
+    help="Add the two macro-momentum expected-return tilts from portfolio/macro_timing.py "
+    "(Oil-sector vs. oil-price momentum, IT-exporter vs. USD/INR momentum - see CLAUDE.md's "
+    "'Alpha research' section). Off by default; fetches Brent crude and USD/INR via yfinance.",
+)
+
+
 @cli.command("optimize-portfolio")
-def optimize_portfolio_cmd() -> None:
+@_macro_timing_option
+def optimize_portfolio_cmd(macro_timing: bool) -> None:
     """Long-only mean-variance optimization against the full-window factor model - see
     portfolio/pipeline.py. Requires `run-all` to have been run first.
     """
     from factor_model.portfolio.pipeline import run_portfolio_optimization
 
-    result = run_portfolio_optimization()
+    result = run_portfolio_optimization(apply_macro_timing=macro_timing)
     click.echo("Expected factor returns (Newey-West significance-shrunk):")
     click.echo(result["shrinkage_detail"].round(6).to_string())
     click.echo("")
@@ -125,13 +134,14 @@ def optimize_portfolio_cmd() -> None:
 
 
 @cli.command("validate-portfolio")
-def validate_portfolio_cmd() -> None:
+@_macro_timing_option
+def validate_portfolio_cmd(macro_timing: bool) -> None:
     """Runs the portfolio optimization and its independent validation suite (model_reviewer's
     checks - see portfolio/validation.py), writing output/portfolio/portfolio_validation_report.md.
     """
     from factor_model.portfolio.pipeline import run_portfolio_optimization, run_portfolio_validation
 
-    result = run_portfolio_optimization()
+    result = run_portfolio_optimization(apply_macro_timing=macro_timing)
     click.echo("Expected factor returns (Newey-West significance-shrunk):")
     click.echo(result["shrinkage_detail"].round(6).to_string())
     click.echo("")
@@ -141,19 +151,35 @@ def validate_portfolio_cmd() -> None:
 
 @cli.command("backtest-portfolio")
 @click.option("--start", default="2025-01-01", help="Backtest start date (holding periods begin here).")
-def backtest_portfolio_cmd(start: str) -> None:
+@_macro_timing_option
+def backtest_portfolio_cmd(start: str, macro_timing: bool) -> None:
     """Walk-forward, monthly-rebalanced backtest of GMV/Max-Sharpe/Equal-Weight from `start`
     through the latest available data - see portfolio/backtest.py. Requires `run-all` to have
     been run first.
     """
     from factor_model.portfolio.pipeline import run_portfolio_backtest
 
-    result = run_portfolio_backtest(start=start)
+    result = run_portfolio_backtest(start=start, apply_macro_timing=macro_timing)
     if result["report_text"]:
         click.echo(result["report_text"])
     else:
         click.echo(result["metrics"].round(4).to_string(index=False))
 
+
+_long_short_option = click.option(
+    "--long-short", is_flag=True, default=False,
+    help="Allow short positions for GMV/Max-Sharpe (portfolio/optimize.py's "
+    "minimize_variance_long_short / trace_efficient_frontier_long_short) instead of long-only, "
+    "subject to a gross-leverage cap (--max-leverage). Equal-Weight stays long-only. Ignores "
+    "--rest-max-stock-weight/--rest-segment-max-weight (the long-short optimizer only supports a "
+    "uniform scalar stock cap and the hard industry cap).",
+)
+_max_leverage_option = click.option(
+    "--max-leverage", type=float, default=None,
+    help="Gross exposure cap sum(|w|) for --long-short, e.g. 1.4 allows up to 20% of capital "
+    "short (funding 20% extra long, a '120/40'-style book). Default: config.MAX_LEVERAGE (1.2, "
+    "i.e. up to 10% short). No effect without --long-short.",
+)
 
 _rest_max_stock_weight_option = click.option(
     "--rest-max-stock-weight", type=float, default=None,
@@ -190,8 +216,12 @@ def _segment_caps_from_options(rest_max_stock_weight, no_industry_cap, rest_segm
 @_no_industry_cap_option
 @_rest_segment_max_weight_option
 @_rest_segment_weight_penalty_option
+@_macro_timing_option
+@_long_short_option
+@_max_leverage_option
 def optimize_portfolio_segments_cmd(
-    rest_max_stock_weight: float | None, no_industry_cap: bool, rest_segment_max_weight: float | None, rest_segment_weight_penalty: float | None
+    rest_max_stock_weight: float | None, no_industry_cap: bool, rest_segment_max_weight: float | None, rest_segment_weight_penalty: float | None,
+    macro_timing: bool, long_short: bool, max_leverage: float | None,
 ) -> None:
     """Long-only mean-variance optimization against the segmented (top100/rest) risk model
     instead of the pooled full-window one - see portfolio/segmented_risk_model.py and CLAUDE.md's
@@ -205,6 +235,7 @@ def optimize_portfolio_segments_cmd(
     result = run_segmented_portfolio_optimization(
         max_stock_weight_by_segment=caps, max_industry_weight=max_industry_weight,
         rest_segment_max_weight=rest_segment_max_weight, rest_segment_weight_penalty=rest_segment_weight_penalty,
+        apply_macro_timing=macro_timing, long_short=long_short, max_leverage=max_leverage,
     )
     click.echo("Expected factor returns (Newey-West significance-shrunk, per segment):")
     click.echo(result["shrinkage_detail"].round(6).to_string())
@@ -217,8 +248,12 @@ def optimize_portfolio_segments_cmd(
 @_no_industry_cap_option
 @_rest_segment_max_weight_option
 @_rest_segment_weight_penalty_option
+@_macro_timing_option
+@_long_short_option
+@_max_leverage_option
 def validate_portfolio_segments_cmd(
-    rest_max_stock_weight: float | None, no_industry_cap: bool, rest_segment_max_weight: float | None, rest_segment_weight_penalty: float | None
+    rest_max_stock_weight: float | None, no_industry_cap: bool, rest_segment_max_weight: float | None, rest_segment_weight_penalty: float | None,
+    macro_timing: bool, long_short: bool, max_leverage: float | None,
 ) -> None:
     """Runs the segmented portfolio optimization and its independent validation suite, writing
     <output_dir>/portfolio_validation_report.md (output/portfolio_segments/ by default, or a
@@ -230,6 +265,7 @@ def validate_portfolio_segments_cmd(
     result = run_segmented_portfolio_optimization(
         max_stock_weight_by_segment=caps, max_industry_weight=max_industry_weight,
         rest_segment_max_weight=rest_segment_max_weight, rest_segment_weight_penalty=rest_segment_weight_penalty,
+        apply_macro_timing=macro_timing, long_short=long_short, max_leverage=max_leverage,
     )
     click.echo("Expected factor returns (Newey-West significance-shrunk, per segment):")
     click.echo(result["shrinkage_detail"].round(6).to_string())
@@ -244,8 +280,12 @@ def validate_portfolio_segments_cmd(
 @_no_industry_cap_option
 @_rest_segment_max_weight_option
 @_rest_segment_weight_penalty_option
+@_macro_timing_option
+@_long_short_option
+@_max_leverage_option
 def backtest_portfolio_segments_cmd(
-    start: str, rest_max_stock_weight: float | None, no_industry_cap: bool, rest_segment_max_weight: float | None, rest_segment_weight_penalty: float | None
+    start: str, rest_max_stock_weight: float | None, no_industry_cap: bool, rest_segment_max_weight: float | None, rest_segment_weight_penalty: float | None,
+    macro_timing: bool, long_short: bool, max_leverage: float | None,
 ) -> None:
     """Walk-forward, monthly-rebalanced backtest of GMV/Max-Sharpe/Equal-Weight against the
     segmented risk model - see portfolio/backtest.py's run_segmented_walk_forward_backtest.
@@ -259,6 +299,7 @@ def backtest_portfolio_segments_cmd(
     result = run_segmented_portfolio_backtest(
         start=start, max_stock_weight_by_segment=caps, max_industry_weight=max_industry_weight,
         rest_segment_max_weight=rest_segment_max_weight, rest_segment_weight_penalty=rest_segment_weight_penalty,
+        apply_macro_timing=macro_timing, long_short=long_short, max_leverage=max_leverage,
     )
     if result["report_text"]:
         click.echo(result["report_text"])

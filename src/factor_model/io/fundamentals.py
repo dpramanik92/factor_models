@@ -56,6 +56,21 @@ CASHFLOW_LABELS = [
     "Net Cash Flow",
 ]
 
+# Labels pulled from the "Quarters" block (last ~10 trailing quarters) - a separate section from
+# annual PROFIT & LOSS, with its own "Report Date" row of quarter-end dates. Used for a quarterly
+# earnings-surprise (SUE) signal - see factors/pead.py and CLAUDE.md's "Alpha research" notes.
+QUARTERLY_LABELS = [
+    "Sales",
+    "Expenses",
+    "Other Income",
+    "Depreciation",
+    "Interest",
+    "Profit before tax",
+    "Tax",
+    "Net profit",
+    "Operating Profit",
+]
+
 
 def _norm(s: object) -> str:
     return str(s).strip().rstrip(":").upper() if pd.notna(s) else ""
@@ -101,6 +116,7 @@ def _row_as_numeric_series(df: pd.DataFrame, row: int, ncols: int) -> np.ndarray
 class ParsedFundamentals:
     company_name: str | None
     annual: pd.DataFrame  # index = FY end date, columns = line items
+    quarterly: pd.DataFrame = None  # index = quarter end date, columns = QUARTERLY_LABELS
 
 
 def parse_fundamentals_file(path: Path) -> ParsedFundamentals:
@@ -173,7 +189,41 @@ def parse_fundamentals_file(path: Path) -> ParsedFundamentals:
             list(annual.index[mismatched].strftime("%Y-%m-%d")),
         )
 
-    return ParsedFundamentals(company_name=company_name, annual=annual)
+    quarterly = _parse_quarterly(raw, col0, bounds, path.name)
+
+    return ParsedFundamentals(company_name=company_name, annual=annual, quarterly=quarterly)
+
+
+def _parse_quarterly(raw: pd.DataFrame, col0: pd.Series, bounds: dict[str, tuple[int, int]], filename: str) -> pd.DataFrame:
+    """Parse the "Quarters" block (its own "Report Date" row of quarter-end dates, separate from
+    the annual PROFIT & LOSS block's) into a quarter-end-indexed DataFrame. Returns an empty
+    (correctly-columned) DataFrame if the block or its date row is missing, rather than raising -
+    quarterly data is not required for the annual-frequency factors the rest of the pipeline uses.
+    """
+    empty = pd.DataFrame(columns=QUARTERLY_LABELS)
+    empty.index.name = "QuarterEnd"
+    if "Quarters" not in bounds:
+        logger.warning("%s: no 'Quarters' section found", filename)
+        return empty
+
+    q_start, q_end = bounds["Quarters"]
+    date_row = _find_label_row(col0, "Report Date", q_start, q_end)
+    if date_row is None:
+        logger.warning("%s: no Report Date row in Quarters block", filename)
+        return empty
+
+    dates_raw = raw.iloc[date_row, 1:]
+    qncols = int(dates_raw.notna().sum())
+    quarter_end = pd.to_datetime(dates_raw.iloc[:qncols], errors="coerce")
+
+    data: dict[str, np.ndarray] = {}
+    for label in QUARTERLY_LABELS:
+        row = _find_label_row(col0, label, q_start, q_end)
+        data[label] = _row_as_numeric_series(raw, row, qncols) if row is not None else np.full(qncols, np.nan)
+
+    quarterly = pd.DataFrame(data, index=quarter_end.iloc[:qncols])
+    quarterly.index.name = "QuarterEnd"
+    return quarterly[~quarterly.index.isna()].sort_index()
 
 
 def parse_all_fundamentals(fundamentals_dir: Path | None = None) -> dict[str, ParsedFundamentals]:

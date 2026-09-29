@@ -31,7 +31,8 @@ import pandas as pd
 
 from factor_model import config
 from factor_model.portfolio.expected_returns import compute_significance_shrunk_expected_returns, project_to_stock_returns
-from factor_model.portfolio.optimize import pick_max_sharpe, trace_efficient_frontier
+from factor_model.portfolio.macro_timing import compute_macro_timing_tilt, fetch_oil_price, fetch_usdinr
+from factor_model.portfolio.optimize import pick_max_sharpe, trace_efficient_frontier, trace_efficient_frontier_long_short
 from factor_model.portfolio.risk_model import build_stock_covariance, get_latest_exposures
 from factor_model.portfolio.segmented_risk_model import (
     build_group_exposure,
@@ -61,12 +62,19 @@ def _month_end_rebalance_dates(index: pd.DatetimeIndex, start: str) -> list[pd.T
 
 
 def run_walk_forward_backtest(
-    start: str = "2025-01-01", frontier_n_points: int = config.BACKTEST_FRONTIER_N_POINTS
+    start: str = "2025-01-01",
+    frontier_n_points: int = config.BACKTEST_FRONTIER_N_POINTS,
+    apply_macro_timing: bool = False,
 ) -> dict:
     """Runs the walk-forward backtest from the last trading day at-or-before the month prior to
     `start` (used to form the first holding period's weights, so the holding periods themselves
     start exactly at `start`) through the latest available data. Requires `run-all` to have been
     run first (reads its output/model_data artifacts; does not rebuild them).
+
+    `apply_macro_timing` adds portfolio/macro_timing.py's two group tilts at every rebalance,
+    each re-estimated from an expanding window truncated to that rebalance's own `as_of` date
+    (never the full history) - the same point-in-time discipline the rest of this backtest
+    already follows. Off by default.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -84,6 +92,12 @@ def run_walk_forward_backtest(
     rebalance_dates = _month_end_rebalance_dates(returns_wide.index, lookback_start)
     if len(rebalance_dates) < 2:
         raise RuntimeError(f"Not enough monthly rebalance dates found from {lookback_start} onward")
+
+    oil_price = usdinr = None
+    if apply_macro_timing:
+        fetch_start = returns_wide.index.min().strftime("%Y-%m-%d")
+        oil_price = fetch_oil_price(fetch_start)
+        usdinr = fetch_usdinr(fetch_start)
 
     portfolio_names = ["GMV", "Max-Sharpe", "Equal-Weight"]
     daily_returns: dict[str, list[pd.Series]] = {name: [] for name in portfolio_names}
@@ -109,6 +123,10 @@ def run_walk_forward_backtest(
         symbols = list(Sigma_asof.index)
         mu_stock_asof = mu_stock_asof.reindex(symbols)
         exposures_asof = exposures_asof.reindex(symbols)
+
+        if apply_macro_timing:
+            macro_tilt_asof = compute_macro_timing_tilt(returns_wide, symbols, oil_price, usdinr, as_of=as_of)
+            mu_stock_asof = mu_stock_asof + macro_tilt_asof.reindex(symbols).fillna(0.0)
 
         frontier_df, gmv = trace_efficient_frontier(
             mu_stock_asof, Sigma_asof, n_points=frontier_n_points,
@@ -164,6 +182,9 @@ def run_segmented_walk_forward_backtest(
     max_industry_weight: float | None = None,
     rest_segment_max_weight: float | None = None,
     rest_segment_weight_penalty: float | None = None,
+    apply_macro_timing: bool = False,
+    long_short: bool = False,
+    max_leverage: float | None = None,
 ) -> dict:
     """Same walk-forward, monthly-rebalanced methodology as run_walk_forward_backtest, but against
     the segmented (top100/rest) risk model (portfolio/segmented_risk_model.py) instead of the
@@ -185,11 +206,21 @@ def run_segmented_walk_forward_backtest(
     segment-scoped regression only used that day's own, already-lagged exposures and that day's
     own return), so truncating both segments' already-built artifacts at each rebalance date is
     sufficient - no need to re-run either segment's cross-sectional regression here.
+
+    `long_short`/`max_leverage` switch GMV/Max-Sharpe to trace_efficient_frontier_long_short at
+    every rebalance instead of the long-only formulation (see optimize.py's
+    minimize_variance_long_short) - individual weights may go negative within
+    +/-config.MAX_STOCK_WEIGHT, subject to a gross-leverage cap `max_leverage` (default
+    config.MAX_LEVERAGE). Equal-Weight is unaffected. As with the pooled-model variants tried
+    before (see this module's own docstring), `max_stock_weight_by_segment`/
+    `rest_segment_max_weight` have no effect when long_short=True - the long-short optimizer only
+    supports a uniform scalar stock cap and the hard industry cap.
     """
     effective_max_industry_weight = max_industry_weight if max_industry_weight is not None else config.MAX_INDUSTRY_WEIGHT
     effective_rest_segment_penalty = (
         rest_segment_weight_penalty if rest_segment_weight_penalty is not None else config.REST_SEGMENT_WEIGHT_SOFT_PENALTY_COEF
     )
+    effective_max_leverage = max_leverage if max_leverage is not None else config.MAX_LEVERAGE
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     segment_paths = {label: config.OutputPaths(config.OUTPUT_DIR / "segments" / label) for label in config.SEGMENT_LABELS}
@@ -212,6 +243,12 @@ def run_segmented_walk_forward_backtest(
     rebalance_dates = _month_end_rebalance_dates(returns_wide.index, lookback_start)
     if len(rebalance_dates) < 2:
         raise RuntimeError(f"Not enough monthly rebalance dates found from {lookback_start} onward")
+
+    oil_price = usdinr = None
+    if apply_macro_timing:
+        fetch_start = returns_wide.index.min().strftime("%Y-%m-%d")
+        oil_price = fetch_oil_price(fetch_start)
+        usdinr = fetch_usdinr(fetch_start)
 
     jcols = joint_design_cols()
     portfolio_names = ["GMV", "Max-Sharpe", "Equal-Weight"]
@@ -260,15 +297,27 @@ def run_segmented_walk_forward_backtest(
             [exposures_by_segment[label][config.INDUSTRY_FACTORS] for label in config.SEGMENT_LABELS], axis=0
         ).reindex(symbols)
 
-        frontier_df, gmv = trace_efficient_frontier(
-            mu_stock_asof, Sigma_asof, n_points=frontier_n_points,
-            industry_exposures=industry_exposures_asof,
-            max_stock_weight=max_stock_weight_asof, max_industry_weight=effective_max_industry_weight,
-            stock_weight_penalty=config.STOCK_WEIGHT_SOFT_PENALTY_COEF,
-            group_exposure=rest_group_exposure_asof,
-            group_max_weight=rest_segment_max_weight if rest_segment_max_weight is not None else 1.0,
-            group_weight_penalty=effective_rest_segment_penalty if rest_segment_max_weight is not None else None,
-        )
+        if apply_macro_timing:
+            macro_tilt_asof = compute_macro_timing_tilt(returns_wide, symbols, oil_price, usdinr, as_of=as_of)
+            mu_stock_asof = mu_stock_asof + macro_tilt_asof.reindex(symbols).fillna(0.0)
+
+        if long_short:
+            frontier_df, gmv = trace_efficient_frontier_long_short(
+                mu_stock_asof, Sigma_asof, n_points=frontier_n_points,
+                industry_exposures=industry_exposures_asof,
+                max_stock_weight=config.MAX_STOCK_WEIGHT, max_industry_weight=effective_max_industry_weight,
+                max_leverage=effective_max_leverage,
+            )
+        else:
+            frontier_df, gmv = trace_efficient_frontier(
+                mu_stock_asof, Sigma_asof, n_points=frontier_n_points,
+                industry_exposures=industry_exposures_asof,
+                max_stock_weight=max_stock_weight_asof, max_industry_weight=effective_max_industry_weight,
+                stock_weight_penalty=config.STOCK_WEIGHT_SOFT_PENALTY_COEF,
+                group_exposure=rest_group_exposure_asof,
+                group_max_weight=rest_segment_max_weight if rest_segment_max_weight is not None else 1.0,
+                group_weight_penalty=effective_rest_segment_penalty if rest_segment_max_weight is not None else None,
+            )
         max_sharpe = pick_max_sharpe(frontier_df)
         equal_weight = pd.Series(1.0 / len(symbols), index=symbols)
 

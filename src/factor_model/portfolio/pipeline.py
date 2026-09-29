@@ -18,7 +18,8 @@ from factor_model.portfolio import validation as pvalidation
 from factor_model.portfolio.backtest import run_segmented_walk_forward_backtest, run_walk_forward_backtest
 from factor_model.portfolio.backtest_report import save_backtest_report
 from factor_model.portfolio.expected_returns import compute_significance_shrunk_expected_returns, project_to_stock_returns
-from factor_model.portfolio.optimize import pick_max_sharpe, trace_efficient_frontier
+from factor_model.portfolio.macro_timing import compute_macro_timing_tilt, fetch_oil_price, fetch_usdinr
+from factor_model.portfolio.optimize import pick_max_sharpe, trace_efficient_frontier, trace_efficient_frontier_long_short
 from factor_model.portfolio.report import save_report as save_portfolio_report
 from factor_model.portfolio.risk_model import build_stock_covariance, get_latest_exposures
 from factor_model.portfolio.segmented_risk_model import (
@@ -35,18 +36,32 @@ from factor_model.portfolio.segmented_risk_model import (
 logger = logging.getLogger(__name__)
 
 
+def _compute_macro_timing_tilt_live(returns_wide: pd.DataFrame, symbols: list[str]) -> pd.Series:
+    """Fetches oil price / USD-INR live (via yfinance) and computes today's macro-timing tilt -
+    the shared helper both the pooled and segmented `apply_macro_timing=True` paths call.
+    """
+    start = returns_wide.index.min().strftime("%Y-%m-%d")
+    oil_price = fetch_oil_price(start)
+    usdinr = fetch_usdinr(start)
+    return compute_macro_timing_tilt(returns_wide, symbols, oil_price, usdinr)
+
+
 def _segmented_output_paths(
     rest_max_stock_weight: float | None = None,
     max_industry_weight: float | None = None,
     rest_segment_max_weight: float | None = None,
+    macro_timing: bool = False,
+    long_short: bool = False,
+    max_leverage: float | None = None,
 ) -> dict:
     """Output/plots/report paths for a segmented portfolio run. The all-defaults case (uniform
     config.MAX_STOCK_WEIGHT single-stock cap, config.MAX_INDUSTRY_WEIGHT industry cap, no group-
-    level rest-segment-total cap) writes to output/portfolio_segments/, unchanged from before any
-    of these knobs existed. Any non-default combination writes to a distinct, suffixed sibling
-    directory instead (e.g. output/portfolio_segments_rest20_noindcap_restcap20/), so trying a
-    different set of caps never overwrites another combination's result - every experiment stays
-    available side by side.
+    level rest-segment-total cap, no macro timing, long-only) writes to output/portfolio_segments/,
+    unchanged from before any of these knobs existed. Any non-default combination writes to a
+    distinct, suffixed sibling directory instead (e.g.
+    output/portfolio_segments_rest20_noindcap_restcap20_macrotiming_longshort20/), so trying a
+    different set of options never overwrites another combination's result - every experiment
+    stays available side by side.
     """
     parts = []
     if rest_max_stock_weight is not None:
@@ -55,6 +70,12 @@ def _segmented_output_paths(
         parts.append("noindcap")
     if rest_segment_max_weight is not None:
         parts.append(f"restcap{int(round(rest_segment_max_weight * 100))}")
+    if macro_timing:
+        parts.append("macrotiming")
+    if long_short:
+        effective_leverage = max_leverage if max_leverage is not None else config.MAX_LEVERAGE
+        short_pct = int(round((effective_leverage - 1.0) / 2.0 * 100))
+        parts.append(f"longshort{short_pct}")
 
     output_dir = config.PORTFOLIO_SEGMENTS_OUTPUT_DIR if not parts else config.OUTPUT_DIR / ("portfolio_segments_" + "_".join(parts))
     return {
@@ -66,9 +87,15 @@ def _segmented_output_paths(
     }
 
 
-def run_portfolio_optimization() -> dict:
+def run_portfolio_optimization(apply_macro_timing: bool = False) -> dict:
     """Runs the full long-only mean-variance optimization exercise against the full-window
     factor model's already-built outputs. Raises if those don't exist yet - run `run-all` first.
+
+    `apply_macro_timing` adds the two group-specific expected-return tilts from
+    portfolio/macro_timing.py (Oil-sector sensitivity to oil-price momentum, IT-exporter
+    sensitivity to USD/INR momentum - see CLAUDE.md's "Alpha research" section) on top of the
+    usual factor-based mu_stock. Off by default so the baseline optimization is unaffected unless
+    explicitly asked for.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -83,8 +110,10 @@ def run_portfolio_optimization() -> dict:
     specific_risk = pd.read_csv(config.SPECIFIC_RISK_FILE)
     returns_wide = pd.read_parquet(config.RETURNS_PANEL_FILE)
 
-    config.PORTFOLIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    config.PORTFOLIO_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = config.PORTFOLIO_MACRO_TIMING_OUTPUT_DIR if apply_macro_timing else config.PORTFOLIO_OUTPUT_DIR
+    plots_dir = config.PORTFOLIO_MACRO_TIMING_PLOTS_DIR if apply_macro_timing else config.PORTFOLIO_PLOTS_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Expected returns and risk model -----------------------------------
     mu_factor, shrinkage_detail = compute_significance_shrunk_expected_returns(factor_returns_daily)
@@ -98,9 +127,13 @@ def run_portfolio_optimization() -> dict:
     exposures = exposures.reindex(symbols)
     logger.info("Optimizable universe: %d symbols", len(symbols))
 
-    save_csv(shrinkage_detail, config.PORTFOLIO_OUTPUT_DIR / "expected_factor_returns.csv", index=True)
-    save_csv(mu_stock.to_frame(), config.PORTFOLIO_OUTPUT_DIR / "expected_stock_returns.csv", index=True)
-    save_csv(Sigma, config.PORTFOLIO_OUTPUT_DIR / "stock_covariance.csv", index=True)
+    if apply_macro_timing:
+        macro_tilt = _compute_macro_timing_tilt_live(returns_wide, symbols)
+        mu_stock = mu_stock + macro_tilt.reindex(symbols).fillna(0.0)
+
+    save_csv(shrinkage_detail, output_dir / "expected_factor_returns.csv", index=True)
+    save_csv(mu_stock.to_frame(), output_dir / "expected_stock_returns.csv", index=True)
+    save_csv(Sigma, output_dir / "stock_covariance.csv", index=True)
 
     # --- Optimization --------------------------------------------------------
     frontier_df, gmv = trace_efficient_frontier(
@@ -119,10 +152,10 @@ def run_portfolio_optimization() -> dict:
         "Equal-Weight": equal_weight_w,
     }
 
-    save_csv(frontier_df.drop(columns=[]), config.PORTFOLIO_OUTPUT_DIR / "efficient_frontier.csv", index=False)
+    save_csv(frontier_df.drop(columns=[]), output_dir / "efficient_frontier.csv", index=False)
     for name, weights in portfolios.items():
         fname = name.lower().replace("-", "_").replace(" ", "_")
-        save_csv(weights.rename("weight").sort_values(ascending=False).to_frame(), config.PORTFOLIO_OUTPUT_DIR / f"weights_{fname}.csv", index=True)
+        save_csv(weights.rename("weight").sort_values(ascending=False).to_frame(), output_dir / f"weights_{fname}.csv", index=True)
 
     # --- Analytics -------------------------------------------------------------
     decomp_by_portfolio = {
@@ -131,7 +164,7 @@ def run_portfolio_optimization() -> dict:
     exposure_by_portfolio = {name: analytics.portfolio_factor_exposure(w, exposures) for name, w in portfolios.items()}
     sector_by_portfolio = {name: analytics.sector_weights(w, exposures) for name, w in portfolios.items()}
     comparison_table = analytics.build_comparison_table(portfolios, exposures, Sigma, mu_stock, factor_covariance, specific_risk)
-    save_csv(comparison_table, config.PORTFOLIO_OUTPUT_DIR / "portfolio_comparison.csv", index=False)
+    save_csv(comparison_table, output_dir / "portfolio_comparison.csv", index=False)
 
     # --- Plots -------------------------------------------------------------
     plot_paths = []
@@ -139,31 +172,31 @@ def run_portfolio_optimization() -> dict:
         pplots.plot_efficient_frontier(
             frontier_df,
             {name: (analytics.risk_decomposition(w, exposures, factor_covariance, specific_risk)["total_variance_daily"] ** 0.5, float(w @ mu_stock.reindex(w.index))) for name, w in portfolios.items()},
-            config.PORTFOLIO_PLOTS_DIR,
+            plots_dir,
         )
     )
     for name, weights in portfolios.items():
         if name != "Equal-Weight":
             fname = f"weights_{name.lower().replace('-', '_').replace(' ', '_')}.png"
-            plot_paths.append(pplots.plot_portfolio_weights(weights, name, fname, config.PORTFOLIO_PLOTS_DIR))
-    plot_paths.append(pplots.plot_factor_tilts(exposure_by_portfolio, config.PORTFOLIO_PLOTS_DIR))
-    plot_paths.append(pplots.plot_sector_weights(sector_by_portfolio, config.PORTFOLIO_PLOTS_DIR))
-    plot_paths.append(pplots.plot_risk_decomposition(decomp_by_portfolio, config.PORTFOLIO_PLOTS_DIR))
-    plot_paths.append(pplots.plot_performance_metrics(comparison_table, config.PORTFOLIO_PLOTS_DIR))
+            plot_paths.append(pplots.plot_portfolio_weights(weights, name, fname, plots_dir))
+    plot_paths.append(pplots.plot_factor_tilts(exposure_by_portfolio, plots_dir))
+    plot_paths.append(pplots.plot_sector_weights(sector_by_portfolio, plots_dir))
+    plot_paths.append(pplots.plot_risk_decomposition(decomp_by_portfolio, plots_dir))
+    plot_paths.append(pplots.plot_performance_metrics(comparison_table, plots_dir))
     backtest_returns_by_portfolio = {
         name: analytics.compute_backtest_return_series(w, returns_wide, config.PORTFOLIO_BACKTEST_LOOKBACK_DAYS)
         for name, w in portfolios.items()
     }
     plot_paths.append(
-        pplots.plot_cumulative_backtest(backtest_returns_by_portfolio, config.PORTFOLIO_BACKTEST_LOOKBACK_DAYS, config.PORTFOLIO_PLOTS_DIR)
+        pplots.plot_cumulative_backtest(backtest_returns_by_portfolio, config.PORTFOLIO_BACKTEST_LOOKBACK_DAYS, plots_dir)
     )
     realized_full = analytics.realized_mean_daily_return(returns_wide[symbols])
     realized_recent = analytics.realized_mean_daily_return(returns_wide[symbols], config.PORTFOLIO_BACKTEST_LOOKBACK_DAYS)
     plot_paths.append(
-        pplots.plot_expected_vs_realized_returns(mu_stock, realized_full, realized_recent, gmv.weights, max_sharpe.weights, config.PORTFOLIO_PLOTS_DIR)
+        pplots.plot_expected_vs_realized_returns(mu_stock, realized_full, realized_recent, gmv.weights, max_sharpe.weights, plots_dir)
     )
 
-    logger.info("Portfolio optimization complete: %d plots written to %s", len(plot_paths), config.PORTFOLIO_PLOTS_DIR)
+    logger.info("Portfolio optimization complete: %d plots written to %s", len(plot_paths), plots_dir)
 
     return {
         "mu_factor": mu_factor,
@@ -183,15 +216,19 @@ def run_portfolio_optimization() -> dict:
         "returns_wide": returns_wide,
         "factor_covariance": factor_covariance,
         "specific_risk": specific_risk,
+        "apply_macro_timing": apply_macro_timing,
     }
 
 
 def run_portfolio_validation(result: dict) -> str:
     """Independent validation of the optimization in `result` (the dict run_portfolio_optimization
     returns) - see portfolio/validation.py for what each check does. Writes
-    output/portfolio/portfolio_validation_report.md. This is the model_reviewer's job
-    (.claude/agents/model_reviewer.md): it only reads the optimization's output, it never
-    adjusts the optimizer to make a check pass.
+    output/portfolio/portfolio_validation_report.md, or
+    output/portfolio_macro_timing/portfolio_validation_report.md if `result` came from an
+    apply_macro_timing=True run (result["apply_macro_timing"]) - never the same file the baseline
+    run writes, so enabling/disabling the flag never overwrites the other's report. This is the
+    model_reviewer's job (.claude/agents/model_reviewer.md): it only reads the optimization's
+    output, it never adjusts the optimizer to make a check pass.
     """
     portfolios = result["portfolios"]
     Sigma = result["Sigma"]
@@ -213,8 +250,13 @@ def run_portfolio_validation(result: dict) -> str:
         pvalidation.test_expected_return_vs_realized_stock_returns(mu_stock, returns_wide),
     ]
 
+    report_file = (
+        config.PORTFOLIO_MACRO_TIMING_VALIDATION_REPORT_FILE
+        if result.get("apply_macro_timing")
+        else config.PORTFOLIO_VALIDATION_REPORT_FILE
+    )
     comparison_table_md = _to_markdown_table(result["comparison_table"].round(4))
-    report_text = save_portfolio_report(tests, result["plot_paths"], comparison_table_md)
+    report_text = save_portfolio_report(tests, result["plot_paths"], comparison_table_md, report_file=report_file)
     return report_text
 
 
@@ -225,18 +267,26 @@ def _to_markdown_table(df: pd.DataFrame) -> str:
     return "\n".join([header, sep, *rows])
 
 
-def run_portfolio_backtest(start: str = "2025-01-01") -> dict:
+def run_portfolio_backtest(start: str = "2025-01-01", apply_macro_timing: bool = False) -> dict:
     """Runs the walk-forward, monthly-rebalanced backtest (portfolio/backtest.py) from `start`
     through the latest available data, computes performance metrics, saves everything under
     output/portfolio/backtest/ (mirrored to data/portfolio/backtest/), and generates the
     cumulative-return/drawdown/turnover plots. See cli.py's `backtest-portfolio` command.
+
+    `apply_macro_timing` adds portfolio/macro_timing.py's two group tilts at every rebalance, and
+    writes to output/portfolio_macro_timing/backtest/ instead of output/portfolio/backtest/ -
+    never the same path the baseline backtest uses, so running one never overwrites the other.
+    Off by default.
     """
-    result = run_walk_forward_backtest(start=start)
+    result = run_walk_forward_backtest(start=start, apply_macro_timing=apply_macro_timing)
     return_series = result["return_series"]
     turnover_df = result["turnover"]
 
-    config.PORTFOLIO_BACKTEST_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    config.PORTFOLIO_PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    backtest_output_dir = config.PORTFOLIO_MACRO_TIMING_BACKTEST_OUTPUT_DIR if apply_macro_timing else config.PORTFOLIO_BACKTEST_OUTPUT_DIR
+    plots_dir = config.PORTFOLIO_MACRO_TIMING_PLOTS_DIR if apply_macro_timing else config.PORTFOLIO_PLOTS_DIR
+    backtest_report_file = config.PORTFOLIO_MACRO_TIMING_BACKTEST_REPORT_FILE if apply_macro_timing else config.PORTFOLIO_BACKTEST_REPORT_FILE
+    backtest_output_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         benchmark_returns = load_benchmark_returns()
@@ -250,38 +300,39 @@ def run_portfolio_backtest(start: str = "2025-01-01") -> dict:
         metrics_input["NIFTY50"] = benchmark_returns.reindex(any_index).fillna(0.0)
 
     metrics = analytics.backtest_performance_metrics(metrics_input, turnover_df)
-    save_csv(metrics, config.PORTFOLIO_BACKTEST_OUTPUT_DIR / "performance_metrics.csv", index=False)
+    save_csv(metrics, backtest_output_dir / "performance_metrics.csv", index=False)
 
     returns_df = pd.DataFrame(metrics_input)
-    save_csv(returns_df, config.PORTFOLIO_BACKTEST_OUTPUT_DIR / "daily_returns.csv", index=True)
-    save_csv(turnover_df, config.PORTFOLIO_BACKTEST_OUTPUT_DIR / "turnover.csv", index=False)
+    save_csv(returns_df, backtest_output_dir / "daily_returns.csv", index=True)
+    save_csv(turnover_df, backtest_output_dir / "turnover.csv", index=False)
 
     plot_paths = [
-        pplots.plot_backtest_cumulative_returns(return_series, benchmark_returns, config.PORTFOLIO_PLOTS_DIR),
-        pplots.plot_backtest_drawdown(return_series, config.PORTFOLIO_PLOTS_DIR),
-        pplots.plot_backtest_turnover(turnover_df, config.PORTFOLIO_PLOTS_DIR),
+        pplots.plot_backtest_cumulative_returns(return_series, benchmark_returns, plots_dir),
+        pplots.plot_backtest_drawdown(return_series, plots_dir),
+        pplots.plot_backtest_turnover(turnover_df, plots_dir),
     ]
     if benchmark_returns is not None:
-        plot_paths.append(pplots.plot_return_correlation_scatter(return_series, benchmark_returns, config.PORTFOLIO_PLOTS_DIR))
+        plot_paths.append(pplots.plot_return_correlation_scatter(return_series, benchmark_returns, plots_dir))
 
     report_text = None
     benchmark_relative = None
     if benchmark_returns is not None:
         benchmark_relative = analytics.benchmark_relative_metrics(return_series, benchmark_returns)
-        save_csv(benchmark_relative, config.PORTFOLIO_BACKTEST_OUTPUT_DIR / "benchmark_relative_metrics.csv", index=False)
+        save_csv(benchmark_relative, backtest_output_dir / "benchmark_relative_metrics.csv", index=False)
 
         performance_table_md = _to_markdown_table(metrics.round(4))
         benchmark_relative_table_md = _to_markdown_table(benchmark_relative.round(4))
         report_text = save_backtest_report(
             performance_table_md, benchmark_relative_table_md, plot_paths,
             start=start, end=str(any_index.max().date()), n_rebalances=len(result["rebalance_dates"]) - 1,
+            report_file=backtest_report_file,
         )
     else:
         logger.warning("Skipping backtest_report.md - no benchmark data available for comparison")
 
     logger.info(
         "Backtest complete: %d rebalances from %s, %d plots written to %s",
-        len(result["rebalance_dates"]) - 1, start, len(plot_paths), config.PORTFOLIO_PLOTS_DIR,
+        len(result["rebalance_dates"]) - 1, start, len(plot_paths), plots_dir,
     )
 
     return {
@@ -301,6 +352,9 @@ def run_segmented_portfolio_optimization(
     max_industry_weight: float | None = None,
     rest_segment_max_weight: float | None = None,
     rest_segment_weight_penalty: float | None = None,
+    apply_macro_timing: bool = False,
+    long_short: bool = False,
+    max_leverage: float | None = None,
 ) -> dict:
     """Mirrors run_portfolio_optimization, but against the segmented (top100/rest) risk model
     (portfolio/segmented_risk_model.py) instead of the pooled full-window one - see
@@ -329,16 +383,38 @@ def run_segmented_portfolio_optimization(
     Any non-default combination of the three writes to a distinct, suffixed sibling directory
     instead of output/portfolio_segments/ (see _segmented_output_paths), so trying a different
     combination never overwrites another run's result.
+
+    `apply_macro_timing` adds the same two portfolio/macro_timing.py tilts
+    run_portfolio_optimization does, on top of the segmented mu_stock. Off by default.
+
+    `long_short` switches GMV/Max-Sharpe to optimize.py's minimize_variance_long_short /
+    trace_efficient_frontier_long_short instead of the long-only formulation - individual weights
+    may go negative (short) within +/-config.MAX_STOCK_WEIGHT, subject to a gross-leverage cap
+    `max_leverage` (default config.MAX_LEVERAGE if not given). Equal-Weight is unaffected (stays
+    long-only 1/n, the benchmark). Note: the long-short optimizer only supports a uniform scalar
+    single-stock cap and the hard per-industry cap - `max_stock_weight_by_segment` and
+    `rest_segment_max_weight`/`rest_segment_weight_penalty` (the group-level soft cap) have no
+    effect when long_short=True (a warning is logged if either is also given).
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    if long_short and (max_stock_weight_by_segment or rest_segment_max_weight is not None):
+        logger.warning(
+            "long_short=True: max_stock_weight_by_segment/rest_segment_max_weight are ignored - "
+            "the long-short optimizer only supports a uniform scalar stock cap and the hard "
+            "industry cap."
+        )
+
     rest_max_stock_weight = max_stock_weight_by_segment["rest"] if max_stock_weight_by_segment else None
-    paths = _segmented_output_paths(rest_max_stock_weight, max_industry_weight, rest_segment_max_weight)
+    paths = _segmented_output_paths(
+        rest_max_stock_weight, max_industry_weight, rest_segment_max_weight, apply_macro_timing, long_short, max_leverage
+    )
     output_dir, plots_dir = paths["output_dir"], paths["plots_dir"]
     effective_max_industry_weight = max_industry_weight if max_industry_weight is not None else config.MAX_INDUSTRY_WEIGHT
     effective_rest_segment_penalty = (
         rest_segment_weight_penalty if rest_segment_weight_penalty is not None else config.REST_SEGMENT_WEIGHT_SOFT_PENALTY_COEF
     )
+    effective_max_leverage = max_leverage if max_leverage is not None else config.MAX_LEVERAGE
 
     segment_paths = {label: config.OutputPaths(config.OUTPUT_DIR / "segments" / label) for label in config.SEGMENT_LABELS}
     required = [config.FACTOR_EXPOSURE_PANEL_FILE, config.RETURNS_PANEL_FILE]
@@ -393,21 +469,34 @@ def run_segmented_portfolio_optimization(
     exposures_raw = pd.concat([exposures_by_segment[label] for label in config.SEGMENT_LABELS], axis=0).reindex(symbols)
     logger.info("Optimizable universe (segmented model): %d symbols", len(symbols))
 
+    if apply_macro_timing:
+        macro_tilt = _compute_macro_timing_tilt_live(returns_wide, symbols)
+        mu_stock = mu_stock + macro_tilt.reindex(symbols).fillna(0.0)
+
     save_csv(shrinkage_detail, output_dir / "expected_factor_returns.csv", index=True)
     save_csv(mu_stock.to_frame(), output_dir / "expected_stock_returns.csv", index=True)
     save_csv(Sigma, output_dir / "stock_covariance.csv", index=True)
 
     # --- Optimization --------------------------------------------------------
-    frontier_df, gmv = trace_efficient_frontier(
-        mu_stock, Sigma,
-        industry_exposures=exposures_raw[config.INDUSTRY_FACTORS],
-        max_stock_weight=max_stock_weight,
-        max_industry_weight=effective_max_industry_weight,
-        stock_weight_penalty=config.STOCK_WEIGHT_SOFT_PENALTY_COEF,
-        group_exposure=rest_group_exposure,
-        group_max_weight=rest_segment_max_weight if rest_segment_max_weight is not None else 1.0,
-        group_weight_penalty=effective_rest_segment_penalty if rest_segment_max_weight is not None else None,
-    )
+    if long_short:
+        frontier_df, gmv = trace_efficient_frontier_long_short(
+            mu_stock, Sigma,
+            industry_exposures=exposures_raw[config.INDUSTRY_FACTORS],
+            max_stock_weight=config.MAX_STOCK_WEIGHT,
+            max_industry_weight=effective_max_industry_weight,
+            max_leverage=effective_max_leverage,
+        )
+    else:
+        frontier_df, gmv = trace_efficient_frontier(
+            mu_stock, Sigma,
+            industry_exposures=exposures_raw[config.INDUSTRY_FACTORS],
+            max_stock_weight=max_stock_weight,
+            max_industry_weight=effective_max_industry_weight,
+            stock_weight_penalty=config.STOCK_WEIGHT_SOFT_PENALTY_COEF,
+            group_exposure=rest_group_exposure,
+            group_max_weight=rest_segment_max_weight if rest_segment_max_weight is not None else 1.0,
+            group_weight_penalty=effective_rest_segment_penalty if rest_segment_max_weight is not None else None,
+        )
     max_sharpe = pick_max_sharpe(frontier_df)
     equal_weight_w = pd.Series(1.0 / len(symbols), index=symbols)
 
@@ -454,7 +543,7 @@ def run_segmented_portfolio_optimization(
     for name, weights in portfolios.items():
         if name != "Equal-Weight":
             fname = f"weights_{name.lower().replace('-', '_').replace(' ', '_')}.png"
-            plot_paths.append(pplots.plot_portfolio_weights(weights, name, fname, plots_dir))
+            plot_paths.append(pplots.plot_portfolio_weights(weights, name, fname, plots_dir, by_abs=long_short))
     plot_paths.append(pplots.plot_factor_tilts(exposure_by_portfolio, plots_dir, design_cols=jcols))
     plot_paths.append(pplots.plot_sector_weights(sector_by_portfolio, plots_dir))
     plot_paths.append(pplots.plot_risk_decomposition(decomp_by_portfolio, plots_dir))
@@ -497,6 +586,8 @@ def run_segmented_portfolio_optimization(
         "max_industry_weight": effective_max_industry_weight,
         "rest_segment_max_weight": rest_segment_max_weight,
         "rest_segment_weight_penalty": effective_rest_segment_penalty if rest_segment_max_weight is not None else None,
+        "long_short": long_short,
+        "max_leverage": effective_max_leverage if long_short else None,
         "output_paths": paths,
     }
 
@@ -516,9 +607,12 @@ def run_segmented_portfolio_validation(result: dict) -> str:
     decomp_by_portfolio = result["decomp_by_portfolio"]
     mu_stock = result["mu_stock"]
     returns_wide = result["returns_wide"]
+    long_short_names = (
+        {"GMV": result["max_leverage"], "Max-Sharpe": result["max_leverage"]} if result.get("long_short") else None
+    )
 
     tests = [
-        pvalidation.test_constraint_satisfaction(portfolios),
+        pvalidation.test_constraint_satisfaction(portfolios, long_short_names=long_short_names),
         pvalidation.test_covariance_psd(Sigma),
         pvalidation.test_optimizer_convergence(frontier_df, result["gmv"].converged),
         pvalidation.test_variance_decomposition_consistency(portfolios, Sigma, decomp_by_portfolio),
@@ -541,6 +635,9 @@ def run_segmented_portfolio_backtest(
     max_industry_weight: float | None = None,
     rest_segment_max_weight: float | None = None,
     rest_segment_weight_penalty: float | None = None,
+    apply_macro_timing: bool = False,
+    long_short: bool = False,
+    max_leverage: float | None = None,
 ) -> dict:
     """Same walk-forward, monthly-rebalanced backtest methodology as run_portfolio_backtest, but
     against the segmented risk model (portfolio/backtest.py's run_segmented_walk_forward_backtest).
@@ -548,9 +645,15 @@ def run_segmented_portfolio_backtest(
     by default, or a distinct sibling directory if any of the cap parameters are given (see
     run_segmented_portfolio_optimization / _segmented_output_paths) - never
     output/portfolio/backtest/, so the pooled-model backtest stays available alongside it.
+
+    `apply_macro_timing` adds portfolio/macro_timing.py's two group tilts at every rebalance. Off
+    by default. `long_short`/`max_leverage` switch GMV/Max-Sharpe to the long-short optimizer at
+    every rebalance too - see run_segmented_portfolio_optimization.
     """
     rest_max_stock_weight = max_stock_weight_by_segment["rest"] if max_stock_weight_by_segment else None
-    paths = _segmented_output_paths(rest_max_stock_weight, max_industry_weight, rest_segment_max_weight)
+    paths = _segmented_output_paths(
+        rest_max_stock_weight, max_industry_weight, rest_segment_max_weight, apply_macro_timing, long_short, max_leverage
+    )
     plots_dir, backtest_output_dir = paths["plots_dir"], paths["backtest_output_dir"]
 
     result = run_segmented_walk_forward_backtest(
@@ -558,6 +661,9 @@ def run_segmented_portfolio_backtest(
         max_industry_weight=max_industry_weight,
         rest_segment_max_weight=rest_segment_max_weight,
         rest_segment_weight_penalty=rest_segment_weight_penalty,
+        apply_macro_timing=apply_macro_timing,
+        long_short=long_short,
+        max_leverage=max_leverage,
     )
     return_series = result["return_series"]
     turnover_df = result["turnover"]

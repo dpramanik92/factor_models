@@ -50,6 +50,33 @@ def build_fundamentals_annual_long(
     return long_df[cols].sort_values(["Symbol", "FiscalYearEnd"]).reset_index(drop=True)
 
 
+def build_fundamentals_quarterly_long(
+    mapping_df: pd.DataFrame, parsed: dict[str, ParsedFundamentals]
+) -> pd.DataFrame:
+    """One row per (Symbol, QuarterEnd) for every included, successfully-parsed file with a
+    non-empty quarterly block (io/fundamentals.py's `Quarters` section - only the last ~10
+    trailing quarters Screener exports, not full history). Exploratory - not part of the main
+    annual-frequency pipeline; see factors/pead.py / CLAUDE.md's "Alpha research" notes.
+    """
+    included = mapping_df[mapping_df["included"]]
+    frames: list[pd.DataFrame] = []
+    for _, row in included.iterrows():
+        stem = Path(row["fundamentals_filename"]).stem
+        item = parsed.get(stem)
+        if item is None or item.quarterly is None or item.quarterly.empty:
+            continue
+        quarterly = item.quarterly.reset_index()
+        quarterly["Symbol"] = row["matched_symbol"]
+        frames.append(quarterly)
+
+    if not frames:
+        return pd.DataFrame()
+
+    long_df = pd.concat(frames, ignore_index=True)
+    cols = ["Symbol", "QuarterEnd"] + [c for c in long_df.columns if c not in ("Symbol", "QuarterEnd")]
+    return long_df[cols].sort_values(["Symbol", "QuarterEnd"]).reset_index(drop=True)
+
+
 def compute_annual_ratios(fundamentals_annual_long: pd.DataFrame) -> pd.DataFrame:
     """Add Leverage, ROA, ROE, Capex (proxy), RevenueGrowth, NetMargin columns."""
     df = fundamentals_annual_long.sort_values(["Symbol", "FiscalYearEnd"]).copy()
@@ -84,6 +111,12 @@ def compute_annual_ratios(fundamentals_annual_long: pd.DataFrame) -> pd.DataFram
     net_block_delta = df["Net Block"] - prior_net_block
     df["Capex"] = _safe_divide(net_block_delta + df["Depreciation"], prior_total_assets)
     df["RevenueGrowth"] = _safe_divide(df["Sales"], prior_sales) - 1.0
+
+    # Accruals (Sloan 1996 earnings-quality anomaly): the portion of reported profit not backed
+    # by operating cash flow, scaled by total assets. Same-period Total Assets (not prior-period),
+    # matching the ROA/NetMargin convention above rather than Capex's prior-period one, since this
+    # is a same-period ratio, not a YoY comparison - see factors/accruals.py.
+    df["Accruals"] = _safe_divide(df["Net profit"] - df["Cash from Operating Activity"], df["Total Assets"])
 
     # A ratio built off a partial/TTM latest FY (or a prior-year gap) is not comparable;
     # NaN it out rather than let it silently look like a normal YoY figure.
